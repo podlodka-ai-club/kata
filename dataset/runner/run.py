@@ -287,7 +287,8 @@ def install_agent_settings(wt: Path, memory_on: bool, write_back: bool) -> None:
 
 
 def install_agent_runtime(wt: Path, cfg, memory_on: bool,
-                          prepared_context: str | None = None) -> dict[str, str]:
+                          prepared_context: str | None = None,
+                          existing_fact_ids: list[str] | None = None) -> dict[str, str]:
     """Копирует минимальный runtime внутрь sandbox и возвращает его env."""
     bin_dir = wt / ".kata-bin"
     bin_dir.mkdir(exist_ok=True)
@@ -307,6 +308,9 @@ def install_agent_runtime(wt: Path, cfg, memory_on: bool,
         env["KATA_HOOKS_DIR"] = str(local_hooks)
         env["KATA_RUN_DIR"] = str(wt / ".kata-run")
         env["KATA_MEMORY_MODE"] = "prepared"
+        id_registry = local_hooks / "existing-fact-ids.json"
+        id_registry.write_text(json.dumps(sorted(existing_fact_ids or [])), encoding="utf-8")
+        env["KATA_EXISTING_FACT_IDS"] = str(id_registry)
         if prepared_context is not None:
             local_context = local_hooks / "task-context.json"
             local_context.write_text(prepared_context, encoding="utf-8")
@@ -360,6 +364,37 @@ def changed_sources(clone: Path, task: Task) -> list[str]:
     return [f for f in out.splitlines() if f.strip() and not f.startswith("tests/")]
 
 
+def effective_agent_cmd(template: list[str], prompt: str, model: str, effort: str,
+                        write_back: bool) -> list[str]:
+    cmd = [part.replace("{prompt}", prompt).replace("{model}", model).replace(
+        "{effort}", effort) for part in template]
+    if write_back and "--allowedTools" in cmd:
+        allowed_index = cmd.index("--allowedTools") + 1
+        rules = [rule for rule in cmd[allowed_index].split(",")
+                 if not rule.startswith("Write(") and rule != "Write"]
+        rules.append("Write")
+        cmd[allowed_index] = ",".join(rules)
+    return cmd
+
+
+def transient_agent_error(stdout: str) -> bool:
+    """Recognize only explicit provider/network failures, never model task failures."""
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return False
+    if not payload.get("is_error"):
+        return False
+    result = str(payload.get("result", "")).lower()
+    return any(marker in result for marker in (
+        "connection closed mid-response",
+        "connection reset",
+        "request timed out",
+        "api error: overloaded",
+        "api error: service unavailable",
+    ))
+
+
 def run_agent(kind: str, cfg, wt: Path, task: Task, clone: Path,
               run_dir: Path, env_extra: dict) -> dict:
     prompt = build_prompt(task)
@@ -401,32 +436,65 @@ def run_agent(kind: str, cfg, wt: Path, task: Task, clone: Path,
         return {"kind": kind, "rc": 2, "wall_sec": time.time() - t0,
                 "usage": {}, "usage_parsed": False,
                 "error": "agent.effort должен быть low/medium/high/xhigh/max"}
-    cmd = [c.replace("{prompt}", prompt).replace("{model}", model).replace("{effort}", effort)
-           for c in cfg["agent"]["cmd"]]
+    cmd = effective_agent_cmd(cfg["agent"]["cmd"], prompt, model, effort,
+                              bool(env_extra.get("KATA_RUN_DIR")))
+    # Claude may normalize a workspace-relative Write target to an absolute temporary
+    # path before permission matching. A selector such as Write(./**) then rejects the
+    # Stop-hook's required `.kata-run/memory_mutations.json`. The OS sandbox still limits
+    # all writes to this disposable workspace, so grant the Write tool itself whenever
+    # write-back is active instead of relying on path-string spelling.
     _, cli_version, _ = sh([cmd[0], "--version"], cwd=wt, env=env_extra, timeout=30)
-    rc, out, err = sh(cmd, cwd=wt, env=env_extra, timeout=cfg["agent"].get("timeout_sec", 3600))
+    max_attempts = 1 + max(0, int(cfg["agent"].get("transient_retries", 1)))
+    attempts = []
+    timeout = cfg["agent"].get("timeout_sec", 3600)
+    for attempt in range(1, max_attempts + 1):
+        rc, out, err = sh(cmd, cwd=wt, env=env_extra, timeout=timeout)
+        attempts.append({"attempt": attempt, "rc": rc, "stdout": out, "stderr": err})
+        if not transient_agent_error(out) or attempt == max_attempts:
+            break
+        interim = capture_diff(wt, run_dir, exclude=cfg["repo"].get("strip_files", []))
+        if interim["files_changed"]:
+            print("[agent] transient provider error after source changes; refusing unsafe retry",
+                  file=sys.stderr)
+            break
+        print(f"[agent] transient provider error with empty diff; retry {attempt + 1}/{max_attempts}",
+              file=sys.stderr)
+
+    if len(attempts) > 1:
+        for item in attempts:
+            prefix = f"agent_attempt{item['attempt']}"
+            (run_dir / f"{prefix}_stdout.log").write_text(item["stdout"], encoding="utf-8")
+            (run_dir / f"{prefix}_stderr.log").write_text(item["stderr"], encoding="utf-8")
     (run_dir / "agent_stdout.log").write_text(out, encoding="utf-8")
     (run_dir / "agent_stderr.log").write_text(err, encoding="utf-8")
 
-    usage, parsed = {}, False
-    try:  # claude -p --output-format json отдаёт usage и стоимость
-        payload = json.loads(out)
-        u = payload.get("usage", {})
-        usage = {
-            "input_tokens": u.get("input_tokens"),
-            "output_tokens": u.get("output_tokens"),
-            "cache_read_tokens": u.get("cache_read_input_tokens"),
-            "cache_creation_tokens": u.get("cache_creation_input_tokens"),
-            "total_cost_usd": payload.get("total_cost_usd"),
-            "num_turns": payload.get("num_turns"),
-        }
-        parsed = True
-    except Exception as e:
-        print(f"[usage] не разобрал вывод агента как JSON ({e}); ценовая ось будет пустой",
-              file=sys.stderr)
+    usage = {key: 0 for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                                 "cache_creation_tokens", "total_cost_usd", "num_turns")}
+    parsed = True
+    for item in attempts:
+        try:  # claude -p --output-format json отдаёт usage и стоимость
+            payload = json.loads(item["stdout"])
+            u = payload.get("usage", {})
+            values = {
+                "input_tokens": u.get("input_tokens"),
+                "output_tokens": u.get("output_tokens"),
+                "cache_read_tokens": u.get("cache_read_input_tokens"),
+                "cache_creation_tokens": u.get("cache_creation_input_tokens"),
+                "total_cost_usd": payload.get("total_cost_usd"),
+                "num_turns": payload.get("num_turns"),
+            }
+            for key, value in values.items():
+                if value is not None:
+                    usage[key] += value
+        except Exception as e:
+            parsed = False
+            print(f"[usage] не разобрал attempt {item['attempt']} как JSON ({e}); "
+                  "ценовая ось будет неполной", file=sys.stderr)
 
     return {"kind": kind, "rc": rc, "wall_sec": time.time() - t0,
             "model": model, "effort": effort, "cli_version": cli_version.strip(),
+            "cmd": cmd, "attempts": len(attempts),
+            "transient_retries": len(attempts) - 1,
             "usage": usage, "usage_parsed": parsed}
 
 
@@ -662,7 +730,8 @@ def main() -> int:
         # Runtime копируется в workspace: subprocess sandbox не получает доступ
         # к reference clone, датасету и снапшоту на хосте.
         env_extra = install_agent_runtime(
-            wt, cfg, memory_on, memory_read.exact_text if memory_read else None)
+            wt, cfg, memory_on, memory_read.exact_text if memory_read else None,
+            (memory_read.metrics.get("existing_fact_ids", []) if memory_read else []))
         if memory_on:
             env_extra.update({
                 "KATA_TASK_ID": task.id,
@@ -794,7 +863,9 @@ def main() -> int:
             "agent_model": agent.get("model", cfg["agent"].get("model")),
             "agent_effort": agent.get("effort", cfg["agent"].get("effort")),
             "agent_cli_version": agent.get("cli_version"),
-            "agent_cmd": cfg["agent"].get("cmd") if kind not in ("null", "oracle") else None,
+            "agent_cmd": agent.get("cmd") if kind not in ("null", "oracle") else None,
+            "agent_attempts": agent.get("attempts", 1),
+            "agent_transient_retries": agent.get("transient_retries", 0),
             "memory_mode": cfg["memory"].get("backend", "file"),
             "memory_write_back": write_back,
             "memory_ok": memory_ok,

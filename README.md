@@ -36,8 +36,8 @@
 Первый seed из PR #8 сохранён как архивный **naive full-snapshot negative control**: read-only
 memory-on получал один полный dump. Новый primary protocol реализует три отдельных stream и не
 переписывает старые результаты. Сначала запускаются бесплатные fake/null/oracle gates, затем canary
-`a3 → a6` одним seed. Полная матрица `6 tasks × 3 modes × 3 repeats` разрешена только после зелёного
-canary; отчёт показывает median/range, а не трактует один seed каузально.
+`a3 → a6` одним seed. Полная матрица `6 tasks × 3 modes × 2 repeats` разрешена только после зелёного
+canary; отчёт показывает оба seed и median/range, а не трактует один seed каузально.
 
 В memory modes порядок семантически значим:
 `a1 → a2 → a3 → [evolve только в третьем режиме] → a4 → a5 → a6`. Каждая задача — новая
@@ -45,6 +45,9 @@ coding-session и независимый code workspace. Перед каждой
 child: a1 клонируется из read-only C0 template, следующая сессия — из предыдущего child. Поэтому
 memory state переживает рестарт только через xmemory, а mutable instance никогда не делится между
 экспериментальными ячейками.
+После подтверждённого clone/read boundary runner удаляет только предыдущий child своего stream,
+а после stream — его tail. C0 остаётся неизменяемым; локальный lineage сохраняет IDs, hashes и
+delete receipts, поэтому ограниченная cloud-retention не превращается в скрытый перенос состояния.
 
 ## Роли и зоны ответственности
 

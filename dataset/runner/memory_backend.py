@@ -9,6 +9,7 @@ local lineage artifacts contain remote ids/hashes only, never fact state.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +35,10 @@ SLICE_OBJECTS = {
 }
 PREFIX_SLICES = {"ac": "api-contracts", "iv": "invariants", "do": "data-ownership",
                  "cf": "config-flags", "gt": "gotchas"}
+COMMON_REMOTE_FACT_FIELDS = {
+    "statement", "content", "evidence", "confidence", "status", "provenance",
+    "auto_approved", "human_notes", "question", "source", "superseded_by", "status_reason",
+}
 FACT_ID_RE = re.compile(r"fact:[a-z]{2}-\d{4}")
 
 
@@ -131,8 +137,32 @@ def state_sha256(state: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+SNAPSHOT_ENCODING = "zlib+base64:"
+MANIFEST_CHUNK_PREFIX = "chunked:v1:"
+MANIFEST_CHUNK_CHARS = 6000
+
+
+def encode_state_snapshot(state: dict[str, Any]) -> str:
+    """Keep the canonical manifest below xmemory's per-string size boundary."""
+    raw = json.dumps(state, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False).encode()
+    return SNAPSHOT_ENCODING + base64.b64encode(zlib.compress(raw, level=9)).decode("ascii")
+
+
+def decode_state_snapshot(value: str) -> dict[str, Any]:
+    """Decode current compact manifests and the raw-JSON C0 format."""
+    if value.startswith(SNAPSHOT_ENCODING):
+        encoded = value[len(SNAPSHOT_ENCODING):]
+        try:
+            raw = zlib.decompress(base64.b64decode(encoded, validate=True))
+        except (ValueError, zlib.error) as error:
+            raise MemoryError("invalid compressed MemoryState snapshot") from error
+        return json.loads(raw)
+    return json.loads(value)
+
+
 def state_object(state: dict[str, Any]) -> dict[str, Any]:
-    """The singleton remote manifest is the cloud source used to clone a session."""
+    """Common manifest metadata; the encoded snapshot may be chunked remotely."""
     return {
         "stream_id": "stream",
         "state_version": state["state_version"],
@@ -140,14 +170,55 @@ def state_object(state: dict[str, Any]) -> dict[str, Any]:
         "mode": state["mode"],
         "seed": state["seed"],
         "c0_sha256": state["c0_sha256"],
-        "snapshot_json": json.dumps(state, sort_keys=True, separators=(",", ":"),
-                                    ensure_ascii=False),
+        "snapshot_json": encode_state_snapshot(state),
         "snapshot_sha256": state_sha256(state),
         "parent_instance_id": (state.get("lineage") or {}).get("parent_instance_id", ""),
         "session_id": (state.get("lineage") or {}).get("session_id", ""),
         "session_kind": (state.get("lineage") or {}).get("session_kind", ""),
-        "updated_at": utcnow(),
     }
+
+
+def manifest_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return a small root record plus fixed-size MemoryState chunk records.
+
+    `manifest_chunk_count` only grows, so every later write can update existing chunk
+    primary keys and create solely the newly required suffix. The field is canonical state,
+    making clone verification independent of local bookkeeping.
+    """
+    count = max(1, int(state.get("manifest_chunk_count", 0)))
+    while True:
+        state["manifest_chunk_count"] = count
+        encoded = encode_state_snapshot(state)
+        needed = max(1, math.ceil(len(encoded) / MANIFEST_CHUNK_CHARS))
+        if needed <= count:
+            break
+        count = needed
+    chunks = [encoded[index:index + MANIFEST_CHUNK_CHARS]
+              for index in range(0, len(encoded), MANIFEST_CHUNK_CHARS)]
+    chunks.extend([""] * (count - len(chunks)))
+    common = state_object(state)
+    root = {**common, "stream_id": "stream",
+            "snapshot_json": f"{MANIFEST_CHUNK_PREFIX}{count}"}
+    records = [root]
+    for index, chunk in enumerate(chunks, 1):
+        records.append({**common, "stream_id": f"stream:{index:04d}",
+                        "snapshot_json": chunk})
+    return records
+
+
+def manifest_mutations(state: dict[str, Any], root_action: str,
+                       previous_chunks: int = 0) -> list[dict[str, Any]]:
+    if root_action not in {"create", "update"}:
+        raise MemoryError(f"invalid manifest action: {root_action}")
+    records = manifest_records(state)
+    mutations = []
+    for index, record in enumerate(records):
+        action = root_action if index == 0 else ("update" if index <= previous_chunks else "create")
+        mutations.append({"object_mutation": {"object_type": "MemoryState", action: {
+            "key": {"stream_id": record["stream_id"]},
+            "values": {key: value for key, value in record.items() if key != "stream_id"},
+        }}})
+    return mutations
 
 
 def _json_field(value: Any) -> Any:
@@ -159,7 +230,7 @@ def state_seed_payload(state: dict[str, Any]) -> dict[str, Any]:
     mutations: list[dict[str, Any]] = []
     for fact in state["facts"].values():
         values = {key: _json_field(value) for key, value in fact.items()
-                  if key not in {"fact_id", "slice", "object_type", "title"}}
+                  if key not in {"fact_id", "slice", "object_type", "title", "created_at"}}
         mutations.append({"object_mutation": {"object_type": fact["object_type"], "create": {
             "key": {"fact_id": fact["fact_id"]}, "values": values}}})
     for task in state.get("tasks", {}).values():
@@ -183,18 +254,12 @@ def state_seed_payload(state: dict[str, Any]) -> dict[str, Any]:
                         {"object_name": "task", "key": {"task_id": task["task_id"]}},
                         {"object_name": snake, "key": {"fact_id": fact_id}},
                     ]}}})
-    manifest = state_object(state)
-    mutations.append({"object_mutation": {"object_type": "MemoryState", "create": {
-        "key": {"stream_id": "stream"},
-        "values": {k: v for k, v in manifest.items() if k != "stream_id"}}}})
+    mutations.extend(manifest_mutations(state, "create"))
     return {"structured_mutations": mutations}
 
 
-def manifest_update_mutation(state: dict[str, Any]) -> dict[str, Any]:
-    manifest = state_object(state)
-    return {"object_mutation": {"object_type": "MemoryState", "update": {
-        "key": {"stream_id": "stream"},
-        "values": {k: v for k, v in manifest.items() if k != "stream_id"}}}}
+def manifest_update_mutations(state: dict[str, Any], previous_chunks: int) -> list[dict[str, Any]]:
+    return manifest_mutations(state, "update", previous_chunks)
 
 
 def apply_batch_to_state(state: dict[str, Any], batch: dict[str, Any],
@@ -365,6 +430,7 @@ class FileMemoryBackend:
             "fallback": True,
             "state_version": state["state_version"],
             "fact_ids": [f["fact_id"] for f in facts],
+            "existing_fact_ids": sorted(state["facts"]),
             "fact_statuses": {f["fact_id"]: f.get("status") for f in facts},
             "facts_count": len(facts),
             "chars": chars,
@@ -429,6 +495,7 @@ class SubprocessXMemoryTransport:
     def __init__(self, xmemcli: str = "xmemcli"):
         self.xmemcli = xmemcli
         self.helper = Path(__file__).with_name("provision_xmemory.py")
+        self.last_load_metrics: dict[str, Any] = {}
 
     def _helper(self, args: list[str], payload: dict[str, Any] | None = None,
                 timeout: int = 420) -> tuple[dict[str, Any], float]:
@@ -451,18 +518,24 @@ class SubprocessXMemoryTransport:
         return doc["instance_id"], {**doc, "wall_sec": round(wall, 4)}
 
     def load_state(self, instance_id: str) -> dict[str, Any]:
-        doc, _ = self._helper(["state", "--instance", instance_id])
+        doc, wall = self._helper(["state", "--instance", instance_id])
+        self.last_load_metrics = {"provider_calls": doc.get("provider_calls", 1),
+                                  "wall_sec": round(wall, 4)}
         return doc["state"]
 
     def retrieve(self, instance_id: str, task_id: str, slices: list[str], query: str,
-                 top_k: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                 top_k: int, fact_ids: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         doc, wall = self._helper(["read-facts", "--instance", instance_id,
                                   "--task", task_id, "--top-k", str(top_k),
-                                  "--slices", *slices], {"query": query})
+                                  "--slices", *slices], {"query": query, "fact_ids": fact_ids})
         return doc["facts"], {**doc.get("metrics", {}), "wall_sec": round(wall, 4)}
 
     def write(self, instance_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         doc, wall = self._helper(["write", "--instance", instance_id], payload)
+        return {**doc, "wall_sec": round(wall, 4)}
+
+    def delete(self, instance_id: str) -> dict[str, Any]:
+        doc, wall = self._helper(["delete", "--instance", instance_id])
         return {**doc, "wall_sec": round(wall, 4)}
 
 
@@ -477,7 +550,8 @@ class XMemoryBackend:
 
     def __init__(self, state_dir: Path, snapshot: Path, mode: str, seed: int,
                  c0_instance_id: str, session_id: str, xmemcli: str = "xmemcli",
-                 name_prefix: str = "kata", transport: Any | None = None):
+                 name_prefix: str = "kata", transport: Any | None = None,
+                 delete_parent_after_clone: bool = False):
         self.state_dir = state_dir
         self.lineage_file = state_dir / "lineage.json"
         self.snapshot = snapshot
@@ -491,6 +565,8 @@ class XMemoryBackend:
         self.instance_id = ""
         self.parent_instance_id = ""
         self.clone_metrics: dict[str, Any] = {}
+        self.delete_parent_after_clone = delete_parent_after_clone
+        self.retention_metrics: dict[str, Any] | None = None
 
     def _lineage(self) -> dict[str, Any]:
         if not self.lineage_file.exists():
@@ -532,6 +608,19 @@ class XMemoryBackend:
                  "state_sha256": state_sha256(state), "created_at": utcnow()}
         lineage["sessions"].append(entry)
         self._save_lineage(lineage)
+        if self.delete_parent_after_clone and self.parent_instance_id != self.c0_instance_id:
+            deleted = self.transport.delete(self.parent_instance_id)
+            self.retention_metrics = {
+                "deleted_instance_id": self.parent_instance_id,
+                "after_verified_clone": self.instance_id,
+                **deleted,
+            }
+            for prior in lineage["sessions"]:
+                if prior["instance_id"] == self.parent_instance_id:
+                    prior["deleted_at"] = utcnow()
+                    prior["delete"] = deleted
+                    break
+            self._save_lineage(lineage)
         return state
 
     def load_state(self) -> dict[str, Any]:
@@ -544,8 +633,18 @@ class XMemoryBackend:
 
     def read(self, task_id: str, slices: list[str], query: str, top_k: int = 20) -> ReadResult:
         state = self.load_state()
+        state_load = getattr(self.transport, "last_load_metrics", {})
+        candidates = [fact for fact in state["facts"].values()
+                      if fact.get("status") == "active" and fact.get("slice") in slices]
+        words = {word for word in re.findall(r"[a-zA-Z_]{4,}", query.lower())}
+        candidates.sort(key=lambda fact: (
+            -sum(word in (fact.get("content") or fact.get("statement", "")).lower()
+                 for word in words),
+            fact["fact_id"],
+        ))
+        candidate_ids = [fact["fact_id"] for fact in candidates[:top_k]]
         facts, provider = self.transport.retrieve(
-            self.instance_id, task_id, slices, query, top_k)
+            self.instance_id, task_id, slices, query, top_k, candidate_ids)
         filtered = []
         for fact in facts:
             fact_id = fact.get("fact_id", "")
@@ -568,32 +667,43 @@ class XMemoryBackend:
             "backend": self.name, "fallback": False, "instance_id": self.instance_id,
             "parent_instance_id": self.parent_instance_id,
             "session_instance_created": True, "clone": self.clone_metrics,
+            "retention": self.retention_metrics,
             "state_version": state["state_version"], "fact_ids": ids,
+            "existing_fact_ids": sorted(state["facts"]),
             "provider_fact_ids": provider.get("provider_fact_ids", ids),
             "provider_response_sha256": provider.get("provider_response_sha256"),
             "provider_response_chars": provider.get("provider_response_chars"),
             "fact_statuses": {f["fact_id"]: f.get("status") for f in facts},
             "facts_count": len(ids), "chars": chars, "estimated_tokens": _tokens(chars),
-            "wall_sec": provider.get("wall_sec", 0.0), "provider_usage": None,
-            "provider_calls": provider.get("provider_calls", 1),
+            "wall_sec": round(state_load.get("wall_sec", 0.0)
+                              + provider.get("wall_sec", 0.0), 4), "provider_usage": None,
+            "provider_calls": (state_load.get("provider_calls", 1)
+                               + provider.get("provider_calls", 1)),
             "clone_provider_calls": self.clone_metrics.get("provider_calls"),
         })
 
     def apply(self, batch: dict[str, Any], injected_ids: list[str], task_id: str) -> dict[str, Any]:
         started = time.monotonic()
         normalized = validate_batch(batch, injected_ids, task_id)
+        current_state = self.load_state()
+        read_before = getattr(self.transport, "last_load_metrics", {})
+        previous_chunks = int(current_state.get("manifest_chunk_count", 0))
         next_state, summary = apply_batch_to_state(
-            self.load_state(), normalized, injected_ids, task_id)
+            current_state, normalized, injected_ids, task_id)
         payload = to_xmemory_mutations(normalized)
-        payload["structured_mutations"].append(manifest_update_mutation(next_state))
+        payload["structured_mutations"].extend(
+            manifest_update_mutations(next_state, previous_chunks))
         provider = self.transport.write(self.instance_id, payload)
         verified = self.load_state()
+        read_after = getattr(self.transport, "last_load_metrics", {})
         if state_sha256(verified) != state_sha256(next_state):
             raise MemoryError("xmemory write committed but remote manifest does not match")
         return {"backend": self.name, "fallback": False, "ok": True, **summary,
                 "schema_changes": 0, "instance_id": self.instance_id,
                 "parent_instance_id": self.parent_instance_id,
-                "provider_calls": provider.get("provider_calls", 1),
+                "provider_calls": (read_before.get("provider_calls", 1)
+                                   + provider.get("provider_calls", 1)
+                                   + read_after.get("provider_calls", 1)),
                 "wall_sec": round(time.monotonic() - started, 4),
                 "remote_state_sha256": state_sha256(verified)}
 
@@ -629,14 +739,26 @@ class XMemoryBackend:
             if fact_id not in state["facts"]:
                 raise MemoryError(f"evolution targets missing {fact_id}")
             values = dict(item.get("values") or {})
+            fact = state["facts"][fact_id]
+            for structural in ("fact_id", "object_type", "slice", "created_at"):
+                if structural not in values:
+                    continue
+                if values[structural] != fact.get(structural):
+                    raise MemoryError(
+                        f"evolution cannot change structural field {structural} for {fact_id}")
+                values.pop(structural)
+            allowed = COMMON_REMOTE_FACT_FIELDS | set(state["schema"].get(fact["object_type"], []))
+            unknown = sorted(set(values) - allowed)
+            if unknown:
+                raise MemoryError(f"evolution has unknown typed fields for {fact_id}: {unknown}")
             if item.get("op") == "stale":
                 values["status"] = "stale"
                 if not values.get("status_reason"):
                     raise MemoryError("evolution stale needs status_reason")
-            state["facts"][fact_id].update(values)
+            fact.update(values)
             remote_values = {key: _json_field(value) for key, value in values.items()}
             mutations.append({"object_mutation": {
-                "object_type": state["facts"][fact_id]["object_type"], "update": {
+                "object_type": fact["object_type"], "update": {
                     "key": {"fact_id": fact_id}, "values": remote_values}}})
 
         decisions = report.get("schema_suggestion_decisions", [])
@@ -674,7 +796,8 @@ class XMemoryBackend:
                       "xmemory_schema_applied": schema_applied}
         state["evolution_checkpoints"].append(checkpoint)
         state["journal"].append({"kind": "evolve", **checkpoint})
-        mutations.append(manifest_update_mutation(state))
+        previous_chunks = int(state.get("manifest_chunk_count", 0))
+        mutations.extend(manifest_update_mutations(state, previous_chunks))
         self.transport.write(self.instance_id, {"structured_mutations": mutations})
         if state_sha256(self.load_state()) != state_sha256(state):
             raise MemoryError("xmemory evolution manifest verification failed")
@@ -696,6 +819,7 @@ def to_xmemory_mutations(batch: dict[str, Any]) -> dict[str, Any]:
         values.pop("fact_id", None)
         values.pop("slice", None)
         values.pop("object_type", None)
+        values.pop("created_at", None)
         for key in ("evidence", "human_notes"):
             if isinstance(values.get(key), (list, dict)):
                 values[key] = json.dumps(values[key], ensure_ascii=False)
@@ -738,5 +862,29 @@ def open_backend(cfg: dict[str, Any], state_dir: Path, snapshot: Path,
         return XMemoryBackend(
             state_dir, snapshot, mode, seed, memory.get("c0_instance_id", ""), session_id,
             memory.get("xmemcli", "xmemcli"), memory.get("instance_name_prefix", "kata"),
-            transport=transport)
+            transport=transport,
+            delete_parent_after_clone=bool(memory.get("delete_parent_after_clone", False)))
     raise MemoryError(f"unknown memory.backend={backend}")
+
+
+def cleanup_xmemory_tail(state_dir: Path, xmemcli: str = "xmemcli",
+                         transport: Any | None = None) -> dict[str, Any]:
+    """Delete only the live tail recorded by this runner lineage, preserving audit metadata."""
+    lineage_file = state_dir / "lineage.json"
+    if not lineage_file.exists():
+        raise MemoryError(f"xmemory lineage missing: {lineage_file}")
+    lineage = json.loads(lineage_file.read_text(encoding="utf-8"))
+    sessions = lineage.get("sessions") or []
+    if not sessions:
+        raise MemoryError("xmemory lineage has no child sessions to clean up")
+    tail = sessions[-1]
+    if tail.get("deleted_at"):
+        return {"ok": True, "instance_id": tail["instance_id"], "already_deleted": True}
+    active_transport = transport or SubprocessXMemoryTransport(xmemcli)
+    deleted = active_transport.delete(tail["instance_id"])
+    tail["deleted_at"] = utcnow()
+    tail["delete"] = deleted
+    tmp = lineage_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, lineage_file)
+    return {"ok": True, "instance_id": tail["instance_id"], **deleted}

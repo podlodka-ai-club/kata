@@ -40,7 +40,7 @@ cmd = [
   "--output-format", "json",
   "--permission-mode", "dontAsk",
   "--tools", "Read,Glob,Grep,Edit,Write,Bash",
-  "--allowedTools", "Read(./**),Glob,Grep,Edit(./**),Write(./**),Bash(uv run pytest *),Bash(git status *),Bash(git diff *)",
+  "--allowedTools", "Read(./**),Glob,Grep,Edit(./**),Write,Bash(uv run pytest *),Bash(git status *),Bash(git diff *)",
   "--setting-sources", "project",
   "--strict-mcp-config",
   "--mcp-config", '{"mcpServers":{}}',
@@ -49,6 +49,7 @@ cmd = [
   "--no-chrome",
 ]
 timeout_sec = 3600
+transient_retries = 1
 
 [memory]
 # Hackathon path: xmemory is the only state carried between sessions. File remains
@@ -60,6 +61,12 @@ retrieval = "task-slices"
 top_k = 20
 xmemcli = "xmemcli"
 instance_name_prefix = "kata"
+
+# Ephemeral research retention: keep the immutable C0 template, but delete only
+# runner-owned parents after a verified clone and the final child after each stream.
+# Local lineage retains remote IDs, hashes, and deletion receipts for audit.
+delete_parent_after_clone = true
+delete_stream_tail = true
 
 # Provision once with provision_xmemory.py. This template is never mutated. Each
 # coding/curator session auto-creates a fresh child from the previous cloud instance.

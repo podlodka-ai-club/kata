@@ -26,7 +26,10 @@ and before a4. You cannot see a repository, future tasks, solution commits, or h
 Review only cloud_memory_state.json, exported for this isolated session from its fresh xmemory
 child: candidates, gotchas, questions, contradictions and duplicate facts.
 Code evidence recorded in facts wins over memory prose. You may update or stale existing facts;
-you must not create coding-solution facts. Propose only additive, domain-typed schema changes.
+you must not create coding-solution facts. `fact_id`, `object_type`, `slice`, and `created_at` are
+immutable: never put them in values and never re-type a fact. If a fact is mistyped, mark it stale
+with status_reason; do not emulate a move between object types. Propose only additive, domain-typed
+schema changes.
 Write evolution_report.json with this exact shape:
 {"mutations":[{"op":"update|stale|noop","fact_id":"fact:...","values":{...}}],
  "schema_changes":[{"kind":"additive","description":"..."}],

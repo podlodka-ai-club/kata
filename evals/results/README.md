@@ -6,6 +6,7 @@
 
 | Дата | Модель | Повторы | Отчёт | Данные |
 | --- | --- | ---: | --- | --- |
+| 2026-09-01 | Claude Sonnet 5, medium | canary: 1 | [cloud xmemory canary a3→a6](2026-09-01-sonnet5-xmemory-canary.md) | [CSV](2026-09-01-sonnet5-xmemory-canary.csv) · [проблемы runner](2026-09-01-sonnet5-xmemory-canary-problems.md) |
 | 2026-09-01 | Claude Sonnet 5, medium | 1 | [memory-off vs memory-on](2026-09-01-sonnet5-medium-seed1.md) | [CSV](2026-09-01-sonnet5-medium-seed1.csv) |
 
 Запись 2026-09-01 — сохранённый **naive full-snapshot negative control**: read-only memory,

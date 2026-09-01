@@ -16,13 +16,16 @@ cloud-to-cloud клонируется из read-only C0 template, для сле�
 
 `memory_backend.py` задаёт один backend-контракт. Официальные memory-прогоны требуют xmemory;
 файловый backend оставлен только для бесплатного state-machine selftest. В xmemory предметные
-facts и Task-relations остаются типизированными. Singleton `MemoryState` хранит canonical JSON
-manifest, digest, версии и journal, чтобы новый instance можно было детерминированно собрать из
-родительского cloud state. Это не Markdown dump и не контекст агента.
+facts и Task-relations остаются типизированными. `MemoryState` хранит маленький root и canonical
+JSON manifest в digest-checked chunks (каждый ниже provider string limit), версии и journal, чтобы
+новый instance можно было детерминированно собрать из родительского cloud state. Это не Markdown
+dump и не контекст агента.
 
-Локальный `_memory/.../lineage.json` содержит только `instance_id`, `parent_instance_id`, версии и
-SHA-256 для аудита. В нём нет facts/tasks/journal; удаление локального state не меняет содержимое
-xmemory. Runtime read, exact injected content и write-back идут через session instance.
+Локальный `_memory/.../lineage.json` содержит только `instance_id`, `parent_instance_id`, версии,
+SHA-256 и delete receipts для аудита. В нём нет facts/tasks/journal. Runtime read, exact injected
+content и write-back идут через session instance. При ephemeral retention предыдущий child удаляется
+только после успешного clone + digest verification, а tail — после завершения целого stream; C0 не
+мутируется и не удаляется.
 
 Перед задачей backend выбирает только `active` facts из `task.slices` (и ранжирует их по тексту
 задачи до `top_k`). SessionStart инжектит подготовленный ответ, а runner сохраняет точный текст,
@@ -101,12 +104,15 @@ backend = "xmemory"
 c0_instance_id = "<c0-template-instance-id>"
 require_xmemory_for_memory_modes = true
 instance_name_prefix = "kata"
+delete_parent_after_clone = true
+delete_stream_tail = true
 ```
 
 Runner сам создаёт fresh child перед каждой memory session и проверяет cloud manifest digest.
-Canary создаст 5 child instances: 4 coding + curator. Full matrix создаст 39: 36 coding + 3
-curator. C0 template общий, но никогда не мутируется. Удаление созданных instances скрипт
-намеренно не автоматизирует.
+Canary создаст 5 child instances: 4 coding + curator. Full matrix с двумя repeats создаст 26:
+24 coding + 2 curator. C0 template общий и никогда не мутируется. Чтобы укладываться в ограничение
+cloud-retention, runner удаляет только собственный verified parent и финальный tail; глобального
+«удалить самый старый instance организации» нет.
 
 ## Один run, canary, full matrix
 
@@ -128,18 +134,25 @@ uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py \
   --config dataset/runner/config.toml \
   --tasks a3 a6 \
   --modes memory-off memory-on memory-on+evolve \
-  --seeds 1 --skip-setup \
+  --seeds 1 --skip-setup --fail-fast \
   --out runs/canary-a3-a6
 ```
 
-Только после зелёного canary — полная матрица с тремя repeats:
+Если sweep оборвался на явной transient-ошибке провайдера, `--resume` сохраняет уже technically
+valid memory-off cells; ineligible строки не перезапускаются ради более удобного результата, а
+остаются для расследования и исключаются только из primary comparison. Частичный memory stream
+никогда не склеивается: он перезапускается от C0. Runner делает один автоматический retry лишь
+для распознанной Claude API / network ошибки при пустом source diff и суммирует стоимость обеих
+попыток.
+
+Только после зелёного canary — полная матрица с двумя repeats:
 
 ```bash
 uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py \
   --config dataset/runner/config.toml \
   --modes memory-off memory-on memory-on+evolve \
-  --seeds 3 --skip-setup \
-  --out runs/full-read-write-evolve-r3
+  --seeds 2 --skip-setup \
+  --out runs/full-read-write-evolve-r2
 ```
 
 Обе команды запускают платные Claude-сессии. Каждый memory task дополнительно делает cloud clone

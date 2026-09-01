@@ -71,7 +71,7 @@ stale fact в used_facts или regression после retrieval. Где CLI не
 
 Сначала бесплатные fake/null/oracle gates. Затем один платный canary `a3→evolve→a6` во всех трёх
 режимах. Только после зелёной regression, write→read и durability trace запускается full matrix с
-тремя repeats. Точные команды — в [`dataset/runner/README.md`](../dataset/runner/README.md).
+двумя repeats. Точные команды — в [`dataset/runner/README.md`](../dataset/runner/README.md).
 
 Зафиксированные результаты складываются в [`results/`](results/README.md). Исходная архивная
 точка: [Sonnet 5 medium, seed 1, 2026-09-01](results/2026-09-01-sonnet5-medium-seed1.md).

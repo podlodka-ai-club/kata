@@ -6,7 +6,7 @@
     python dataset/runner/sweep.py --selftest
 
     # full three-mode matrix (paid; only after canary)
-    python dataset/runner/sweep.py --seeds 3
+    python dataset/runner/sweep.py --seeds 2
 
     # одна задача, быстро
     python dataset/runner/sweep.py --tasks a3 --seeds 1
@@ -25,6 +25,8 @@ import sys
 import tomllib
 from statistics import median
 from pathlib import Path
+
+from memory_backend import MemoryError, cleanup_xmemory_tail
 
 try:
     import yaml
@@ -53,6 +55,23 @@ def one(task: str, mode: str, seed: int, extra: list[str], out: str = "runs",
     return subprocess.run(cmd, cwd=ROOT).returncode
 
 
+def cleanup_tail(state: str, cfg: dict, out: str) -> bool:
+    """Delete only this runner stream's live tail; never prune organisation-wide instances."""
+    if not cfg.get("memory", {}).get("delete_stream_tail", False):
+        return True
+    state_dir = (ROOT / state).resolve()
+    try:
+        result = cleanup_xmemory_tail(
+            state_dir, cfg.get("memory", {}).get("xmemcli", "xmemcli"))
+    except MemoryError as exc:
+        print(f"[retention] stream-tail cleanup failed: {exc}", file=sys.stderr)
+        return False
+    artifact = state_dir / "cleanup.json"
+    artifact.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"[retention] deleted runner-owned stream tail {result['instance_id']}")
+    return True
+
+
 def collect(out_dir: Path, expected: set[tuple[str, str, int]] | None = None) -> list[dict]:
     """Только настоящие прогоны текущей матрицы.
 
@@ -76,7 +95,8 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
     cols = ["task", "transfer_cluster", "mode", "seed", "agent", "agent_model", "agent_effort", "valid_run",
             "invalid_reasons", "analytical_eligible", "analytical_ineligible_reasons",
             "task_success", "score", "hidden_micro_score", "score_binary", "feature_lift", "feature_passed",
-            "feature_total", "agent_rc", "hidden_passed", "hidden_total", "hidden_failed",
+            "feature_total", "agent_rc", "agent_attempts", "agent_transient_retries",
+            "hidden_passed", "hidden_total", "hidden_failed",
             "regression_green", "tests_added", "existing_tests_modified", "existing_tests_deleted",
             "architecture_score", "architecture_green", "files_changed", "insertions", "deletions",
             "files_read", "time_to_first_relevant_file_sec", "wall_sec", "input_tokens", "output_tokens", "cache_read_tokens",
@@ -85,6 +105,8 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
             "context_tokens", "retrieval_precision", "retrieval_coverage", "irrelevant_facts",
             "memory_instance_id", "memory_parent_instance_id", "memory_session_instance_created",
             "memory_clone_wall_sec", "memory_clone_provider_calls",
+            "memory_retention_deleted_instance_id", "memory_retention_wall_sec",
+            "memory_retention_provider_calls",
             "memory_state_before", "memory_state_after", "memory_creates", "memory_updates",
             "memory_stale", "memory_noop", "memory_gotchas", "memory_schema_changes",
             "memory_read_wall_sec", "memory_write_wall_sec", "memory_read_provider_calls",
@@ -100,6 +122,7 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
             u = r.get("usage") or {}
             grading = r.get("grading") or {}
             retrieval = r.get("retrieval") or {}
+            retention = retrieval.get("retention") or {}
             write = r.get("memory_write") or {}
             mutations = write.get("mutations") or {}
             tests = r.get("diff", {}).get("test_changes", {})
@@ -129,6 +152,8 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
                 "feature_passed": grading.get("feature_passed"),
                 "feature_total": grading.get("feature_total"),
                 "agent_rc": r.get("agent_rc"),
+                "agent_attempts": r.get("agent_attempts", 1),
+                "agent_transient_retries": r.get("agent_transient_retries", 0),
                 "hidden_passed": r["hidden"].get("passed"),
                 "hidden_total": r["hidden"].get("tests", 0) - r["hidden"].get("skipped", 0),
                 "hidden_failed": r["hidden"].get("failed", 0) + r["hidden"].get("errors", 0),
@@ -164,6 +189,9 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
                 "memory_session_instance_created": retrieval.get("session_instance_created"),
                 "memory_clone_wall_sec": (retrieval.get("clone") or {}).get("wall_sec"),
                 "memory_clone_provider_calls": retrieval.get("clone_provider_calls"),
+                "memory_retention_deleted_instance_id": retention.get("deleted_instance_id"),
+                "memory_retention_wall_sec": retention.get("wall_sec"),
+                "memory_retention_provider_calls": retention.get("provider_calls"),
                 "memory_state_before": write.get("state_version_before", retrieval.get("state_version")),
                 "memory_state_after": write.get("state_version_after"),
                 "memory_creates": mutations.get("create"), "memory_updates": mutations.get("update"),
@@ -234,13 +262,17 @@ def main() -> int:
     ap.add_argument("--tasks", nargs="*", help="подмножество id задач")
     ap.add_argument("--modes", nargs="*", choices=MODES, default=MODES,
                     help="режимы; evolving modes always run as chronological streams")
-    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--out", default="runs")
     ap.add_argument("--selftest", action="store_true",
                     help="прогнать null и oracle: каркас должен показать красно и зелёно")
     ap.add_argument("--memory-selftest", action="store_true",
                     help="free fake-backend state-machine/isolation/durability tests")
     ap.add_argument("--skip-setup", action="store_true")
+    ap.add_argument("--fail-fast", action="store_true",
+                    help="stop the paid matrix after the first failed/invalid cell, after cleanup")
+    ap.add_argument("--resume", action="store_true",
+                    help="reuse technically valid cells; partial memory streams restart at C0")
     args = ap.parse_args()
 
     if args.memory_selftest:
@@ -289,20 +321,40 @@ def main() -> int:
             return 3
     expected = {(task, mode, seed) for task in ids for mode in modes_requested
                 for seed in range(1, args.seeds + 1)}
+    existing_rows = collect(ROOT / args.out, expected) if args.resume else []
+    existing = {(row["task"], row["mode"], row["seed"]): row for row in existing_rows}
     failed_commands = []
     canonical = task_ids(ROOT / args.tasks_file)
     ids = sorted(ids, key=canonical.index)
+    abort_sweep = False
     for seed in range(1, args.seeds + 1):
         # Balance whole streams between repeats. Within a memory stream order is semantic.
         stream_modes = modes_requested if seed % 2 else list(reversed(modes_requested))
         for mode in stream_modes:
+            stream_keys = [(task, mode, seed) for task in ids]
+            if (args.resume and mode != "memory-off" and stream_keys
+                    and all(existing.get(key, {}).get("valid_run") for key in stream_keys)):
+                print(f"[resume] complete valid stream retained: {mode} seed{seed}")
+                continue
+            if (args.resume and mode != "memory-off"
+                    and any(existing.get(key, {}).get("valid_run") for key in stream_keys)):
+                print(f"[resume] partial memory stream restarts from C0: {mode} seed{seed}")
             state = f"{args.out}/_memory/{mode}/seed{seed}" if mode != "memory-off" else None
             evolved = False
+            stream_failed = False
             for index, task in enumerate(ids):
+                key = (task, mode, seed)
+                if (args.resume and mode == "memory-off"
+                        and existing.get(key, {}).get("valid_run")):
+                    print(f"[resume] valid cell retained: {task} · {mode} · seed{seed}")
+                    continue
                 reset = bool(state and index == 0)
                 if one(task, mode, seed, extra, out=args.out,
                        memory_state=state, reset_memory=reset) != 0:
                     failed_commands.append((task, mode, seed))
+                    stream_failed = True
+                    if args.fail_fast:
+                        break
                 if mode == "memory-on+evolve" and task == "a3":
                     evolve_out = f"{args.out}/_evolution/{mode}/seed{seed}"
                     evolve_cmd = EVOLVE + ["--config", args.config, "--mode", mode,
@@ -311,9 +363,19 @@ def main() -> int:
                     print(f"\n=== evolve checkpoint · {mode} · seed{seed} " + "=" * 20)
                     if subprocess.run(evolve_cmd, cwd=ROOT).returncode != 0:
                         failed_commands.append(("evolve", mode, seed))
+                        stream_failed = True
+                        break  # a6 must never consume a failed/nonexistent curator checkpoint
                     evolved = True
-            if mode == "memory-on+evolve" and "a3" in ids and not evolved:
+            if mode == "memory-on+evolve" and "a3" in ids and not evolved and not stream_failed:
                 failed_commands.append(("evolve-missing", mode, seed))
+            if state and not cleanup_tail(state, cfg, args.out):
+                failed_commands.append(("cleanup-tail", mode, seed))
+                stream_failed = True
+            if stream_failed and args.fail_fast:
+                abort_sweep = True
+                break
+        if abort_sweep:
+            break
 
     rows = collect(ROOT / args.out, expected)
     write_table(rows, ROOT / args.out)
