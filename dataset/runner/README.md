@@ -6,16 +6,23 @@
 - `memory-on` — хронологический поток `read → coding task → validated write`;
 - `memory-on+evolve` — тот же поток, но после `a3` и до `a4` запускается отдельная curator-session.
 
-Каждая coding task остаётся новой Claude-сессией и одноразовым workspace. Долговечное состояние
-живет отдельно, в уникальном stream `mode/seed`, клонированном из frozen C0. Поэтому код задач не
-накапливается, а опыт в памяти — накапливается. Потоки `memory-on` и `memory-on+evolve` одного seed
-стартуют из побайтово одинакового C0, но никогда не используют общий state/instance.
+Каждая coding task остаётся новой Claude-сессией и одноразовым workspace. В memory modes перед
+**каждой** coding/curator-сессией создаётся новый xmemory instance: для первой сессии он
+cloud-to-cloud клонируется из read-only C0 template, для следующих — из instance предыдущей
+сессии. Поэтому код задач не накапливается, опыт накапливается в цепочке xmemory instances, а
+ни одна параллельная экспериментальная ячейка не делит mutable instance.
 
 ## Что реализовано
 
-`memory_backend.py` задаёт один backend-контракт. Primary для demo/evolve — xmemory. Файловый
-backend — воспроизводимый bulk/selftest fallback: он сохраняет те же lifecycle/provenance semantics,
-Task-relations, journal и версии, но в метриках явно имеет `fallback=true`.
+`memory_backend.py` задаёт один backend-контракт. Официальные memory-прогоны требуют xmemory;
+файловый backend оставлен только для бесплатного state-machine selftest. В xmemory предметные
+facts и Task-relations остаются типизированными. Singleton `MemoryState` хранит canonical JSON
+manifest, digest, версии и journal, чтобы новый instance можно было детерминированно собрать из
+родительского cloud state. Это не Markdown dump и не контекст агента.
+
+Локальный `_memory/.../lineage.json` содержит только `instance_id`, `parent_instance_id`, версии и
+SHA-256 для аудита. В нём нет facts/tasks/journal; удаление локального state не меняет содержимое
+xmemory. Runtime read, exact injected content и write-back идут через session instance.
 
 Перед задачей backend выбирает только `active` facts из `task.slices` (и ранжирует их по тексту
 задачи до `top_k`). SessionStart инжектит подготовленный ответ, а runner сохраняет точный текст,
@@ -24,11 +31,11 @@ fact IDs, chars/estimated tokens, precision/coverage и irrelevant IDs. Полн
 Stop-hook возвращает coding-agent на U3 один раз. Агент пишет
 `.kata-run/memory_mutations.json`; runner валидирует `create/update/stale/noop`, evidence,
 `Task.used_facts/produced_facts`, применяет batch backend’ом и только затем повышает state version.
-Следующая новая сессия заново открывает state и читает уже записанные изменения — это durability
-boundary, а не перенос контекста Claude.
+Следующая новая сессия создаёт child из записанного parent instance и читает изменения уже из
+child — это наблюдаемый cloud durability/clone boundary, а не перенос контекста Claude.
 
 Evolution checkpoint не имеет checkout Mealie, будущих задач, solution commits или hidden tests.
-Curator видит только накопленный audit shadow, candidates/gotchas/questions и xmemory schema
+Curator видит только cloud `MemoryState`, candidates/gotchas/questions и xmemory schema
 suggestions. Он может дедуплицировать, разрешать противоречия по evidence («код прав»), stale/update
 существующие facts и принять/отложить schema suggestions. Создавать solution facts ему запрещено.
 
@@ -40,10 +47,10 @@ suggestions. Он может дедуплицировать, разрешать 
 uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py --memory-selftest
 ```
 
-Этот fake/file selftest не вызывает Claude или xmemory и проверяет isolation mode/seed,
-chronological write→read, повторное открытие state после «рестарта», task-relevant retrieval,
-evolution checkpoint, запрет будущих create из curator-session, Task provenance, typed xmemory
-relations, `feature_lift` boundaries и analytical eligibility.
+Этот fake transport/file selftest не вызывает Claude или xmemory и проверяет isolation mode/seed,
+новый cloud child на каждую сессию, отсутствие локального fact-state, chronological write→clone→read,
+curator child, task-relevant retrieval, evolution checkpoint, Task provenance, typed xmemory
+objects/relations/manifest, `feature_lift` boundaries и analytical eligibility.
 
 Затем обязательный null/oracle gate всех hidden suites (тоже без модели/xmemory):
 
@@ -61,45 +68,45 @@ uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py \
 cp dataset/runner/config.example.toml dataset/runner/config.toml
 ```
 
-Для бесплатного/reproducible bulk режима оставьте:
+File backend предназначен только для selftest/debug и не допускается в официальный memory sweep:
 
 ```toml
 [memory]
 backend = "file"
+require_xmemory_for_memory_modes = false
 snapshot = "dataset/facts/snapshot-c0.md"
 retrieval = "task-slices"
 top_k = 20
 write_back = true
 ```
 
-Это полноценный read/write lifecycle, но не xmemory; отчёты маркируют его fallback.
+Он маркируется `fallback=true`. По умолчанию `require_xmemory_for_memory_modes=true`, поэтому
+случайно получить исследовательскую строку без xmemory нельзя.
 
-Для настоящего xmemory demo сначала авторизуйтесь вне репозитория, затем создайте отдельные
-инстансы. Команды ниже делают control-plane create и один structured C0 seed; они требуют
-xmemory quota, но не Claude:
+Для canary/full сначала авторизуйтесь вне репозитория и один раз создайте read-only C0 template.
+Команда создаёт schema, типизированные C0 objects и `MemoryState`; она требует xmemory quota,
+но не Claude:
 
 ```bash
 xmemcli auth status
-python dataset/runner/provision_xmemory.py provision \
-  --name kata-memory-on-seed1 --snapshot dataset/facts/snapshot-c0.md
-python dataset/runner/provision_xmemory.py provision \
-  --name kata-memory-on-evolve-seed1 --snapshot dataset/facts/snapshot-c0.md
+uv run --python 3.12 python dataset/runner/provision_xmemory.py provision \
+  --name kata-c0-template --snapshot dataset/facts/snapshot-c0.md
 ```
 
-Скопируйте два `instance_id` в `config.toml`:
+Скопируйте полученный `instance_id` в `config.toml`:
 
 ```toml
 [memory]
 backend = "xmemory"
-
-[memory.xmemory_instances]
-"memory-on.seed1" = "<instance-id-1>"
-"memory-on+evolve.seed1" = "<instance-id-2>"
+c0_instance_id = "<c0-template-instance-id>"
+require_xmemory_for_memory_modes = true
+instance_name_prefix = "kata"
 ```
 
-Для full sweep с тремя repeats нужно шесть инстансов: по одному для каждой пары
-`(memory-on|memory-on+evolve, seed1|seed2|seed3)`. Runner отвергает пустой неявный id;
-не переиспользуйте инстанс между ключами. Удаление инстансов скрипт намеренно не автоматизирует.
+Runner сам создаёт fresh child перед каждой memory session и проверяет cloud manifest digest.
+Canary создаст 5 child instances: 4 coding + curator. Full matrix создаст 39: 36 coding + 3
+curator. C0 template общий, но никогда не мутируется. Удаление созданных instances скрипт
+намеренно не автоматизирует.
 
 ## Один run, canary, full matrix
 
@@ -135,8 +142,10 @@ uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py \
   --out runs/full-read-write-evolve-r3
 ```
 
-Обе команды запускают платные Claude-сессии; xmemory backend дополнительно расходует read/write и
-schema-suggestion quota. Runner не запускает их из selftest и не запускает автоматически.
+Обе команды запускают платные Claude-сессии. Каждый memory task дополнительно делает cloud clone
+(parent read, schema read, create, structured seed, verification), relevant read и validated write;
+curator создаёт ещё один child и обращается к schema suggestions. Runner не запускает эти команды
+из selftest и не запускает автоматически.
 
 ## Pristine grading и eligibility
 
@@ -165,9 +174,11 @@ lift не зажимается: это сигнал вреда/регресси�
 
 Для каждой task: `metrics.json`, pristine `regression.xml`, `hidden.xml`, `diff.patch`,
 `memory_read.json`, `memory_write.json`, exact `context_injected.txt`, mutation batch и
-`attribution.json`. Состояние stream лежит в `_memory/<mode>/seedN/state.json`; evolution — в
-`_evolution/memory-on+evolve/seedN/evolution.json`. Общий `results.csv` содержит coding/read/write/
-evolve cost отдельно, retrieval, lifecycle mutations, architecture placement и eligibility.
+`attribution.json`. `_memory/<mode>/seedN/lineage.json` содержит только цепочку remote IDs/hashes;
+semantic state живёт в xmemory `MemoryState` и типизированных objects/relations. Evolution лежит в
+`_evolution/memory-on+evolve/seedN/evolution.json`. Общий `results.csv` содержит child/parent IDs,
+clone/read/write/evolve cost отдельно, retrieval, lifecycle mutations, architecture placement и
+eligibility.
 
 `files_read` и `time_to_first_relevant_file` записываются как unavailable, если выбранный CLI не
 даёт tool trace. Runner не подменяет отсутствие trace выдуманным числом.

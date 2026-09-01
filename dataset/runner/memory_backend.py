@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Durable, isolated memory backends for the chronological kata evaluation.
 
-The file backend is the reproducible fallback and the fake used by selftests.  It
-keeps the same lifecycle, provenance and Task relations as xmemory.  The xmemory
-backend keeps a local audit shadow, but reads and structured writes go through a
-dedicated xmemory instance supplied for exactly one mode/seed stream.
+The file backend is the reproducible fallback and the fake used by selftests. The
+xmemory backend keeps all semantic state in cloud objects/relations plus a typed
+MemoryState manifest. Every coding/curator session gets a newly cloned instance;
+local lineage artifacts contain remote ids/hashes only, never fact state.
 """
 
 from __future__ import annotations
@@ -15,7 +15,9 @@ import math
 import os
 import re
 import subprocess
+import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -122,6 +124,141 @@ def new_state(snapshot: Path, mode: str, seed: int, backend: str) -> dict[str, A
     }
 
 
+def state_sha256(state: dict[str, Any]) -> str:
+    """Stable digest of the canonical state stored inside xmemory."""
+    payload = json.dumps(state, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def state_object(state: dict[str, Any]) -> dict[str, Any]:
+    """The singleton remote manifest is the cloud source used to clone a session."""
+    return {
+        "stream_id": "stream",
+        "state_version": state["state_version"],
+        "schema_version": state["schema_version"],
+        "mode": state["mode"],
+        "seed": state["seed"],
+        "c0_sha256": state["c0_sha256"],
+        "snapshot_json": json.dumps(state, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=False),
+        "snapshot_sha256": state_sha256(state),
+        "parent_instance_id": (state.get("lineage") or {}).get("parent_instance_id", ""),
+        "session_id": (state.get("lineage") or {}).get("session_id", ""),
+        "session_kind": (state.get("lineage") or {}).get("session_kind", ""),
+        "updated_at": utcnow(),
+    }
+
+
+def _json_field(value: Any) -> Any:
+    return json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value
+
+
+def state_seed_payload(state: dict[str, Any]) -> dict[str, Any]:
+    """Materialize a canonical state as typed xmemory objects and relations."""
+    mutations: list[dict[str, Any]] = []
+    for fact in state["facts"].values():
+        values = {key: _json_field(value) for key, value in fact.items()
+                  if key not in {"fact_id", "slice", "object_type", "title"}}
+        mutations.append({"object_mutation": {"object_type": fact["object_type"], "create": {
+            "key": {"fact_id": fact["fact_id"]}, "values": values}}})
+    for task in state.get("tasks", {}).values():
+        values = {"title": task.get("title", task["task_id"]), "at": task.get("at", ""),
+                  "used_facts": _json_field(task.get("used_facts", [])),
+                  "produced_facts": _json_field(task.get("produced_facts", [])),
+                  "decisions": _json_field(task.get("decisions", []))}
+        mutations.append({"object_mutation": {"object_type": "Task", "create": {
+            "key": {"task_id": task["task_id"]}, "values": values}}})
+        for verb, ids in (("used", task.get("used_facts", [])),
+                          ("produced", task.get("produced_facts", []))):
+            for fact_id in ids:
+                fact = state["facts"].get(fact_id)
+                if not fact:
+                    raise MemoryError(f"Task relation targets missing fact {fact_id}")
+                snake = {"ApiContract": "api_contract", "Invariant": "invariant",
+                         "DataOwnership": "data_ownership", "ConfigFlag": "config_flag",
+                         "Gotcha": "gotcha"}[fact["object_type"]]
+                mutations.append({"relation_mutation": {
+                    "relation_type": f"task_{verb}_{snake}", "create": {"endpoints": [
+                        {"object_name": "task", "key": {"task_id": task["task_id"]}},
+                        {"object_name": snake, "key": {"fact_id": fact_id}},
+                    ]}}})
+    manifest = state_object(state)
+    mutations.append({"object_mutation": {"object_type": "MemoryState", "create": {
+        "key": {"stream_id": "stream"},
+        "values": {k: v for k, v in manifest.items() if k != "stream_id"}}}})
+    return {"structured_mutations": mutations}
+
+
+def manifest_update_mutation(state: dict[str, Any]) -> dict[str, Any]:
+    manifest = state_object(state)
+    return {"object_mutation": {"object_type": "MemoryState", "update": {
+        "key": {"stream_id": "stream"},
+        "values": {k: v for k, v in manifest.items() if k != "stream_id"}}}}
+
+
+def apply_batch_to_state(state: dict[str, Any], batch: dict[str, Any],
+                         injected_ids: list[str], task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Pure lifecycle transition shared by file and cloud implementations."""
+    batch = validate_batch(batch, injected_ids, task_id)
+    state = json.loads(json.dumps(state))
+    before = state["state_version"]
+    counts = {"create": 0, "update": 0, "stale": 0, "noop": 0}
+    gotchas = 0
+    for item in batch["mutations"]:
+        op = item["op"]
+        fact_id = item.get("fact_id") or (item.get("fact") or {})["fact_id"]
+        counts[op] += 1
+        if op == "noop":
+            continue
+        if op == "create":
+            if fact_id in state["facts"]:
+                raise MemoryError(f"create collides with existing {fact_id}")
+            fact = dict(item.get("fact") or {})
+            fact.setdefault("fact_id", fact_id)
+            prefix = fact_id.split(":")[1].split("-")[0]
+            if prefix not in PREFIX_SLICES:
+                raise MemoryError(f"unknown fact prefix: {fact_id}")
+            fact.setdefault("slice", PREFIX_SLICES[prefix])
+            fact.setdefault("object_type", SLICE_OBJECTS[fact["slice"]])
+            fact.setdefault("status", "candidate")
+            fact.setdefault("confidence", "low")
+            fact.setdefault("provenance", "inferred")
+            fact.setdefault("source", "task")
+            fact.setdefault("evidence", [])
+            fact.setdefault("created_at", utcnow())
+            if not fact.get("evidence"):
+                raise MemoryError(f"new fact has no evidence: {fact_id}")
+            fact.setdefault("content", fact.get("statement", ""))
+            state["facts"][fact_id] = fact
+            gotchas += fact.get("slice") == "gotchas"
+        else:
+            if fact_id not in state["facts"]:
+                raise MemoryError(f"{op} targets missing {fact_id}")
+            values = dict(item.get("values") or {})
+            if op == "stale":
+                values["status"] = "stale"
+                if not values.get("status_reason"):
+                    raise MemoryError(f"stale needs status_reason: {fact_id}")
+            state["facts"][fact_id].update(values)
+    state["tasks"][task_id] = {
+        **batch["task"], "at": utcnow(), "used_facts": batch["task"].get("used_facts", []),
+        "produced_facts": batch["task"].get("produced_facts", []),
+    }
+    state["state_version"] += 1
+    state["journal"].append({
+        "kind": "task_write", "task_id": task_id, "at": utcnow(),
+        "version_before": before, "version_after": state["state_version"],
+        "counts": counts, "used_facts": state["tasks"][task_id]["used_facts"],
+        "produced_facts": state["tasks"][task_id]["produced_facts"],
+    })
+    summary = {"state_version_before": before, "state_version_after": state["state_version"],
+               "mutations": counts, "gotchas": gotchas,
+               "used_facts": state["tasks"][task_id]["used_facts"],
+               "produced_facts": state["tasks"][task_id]["produced_facts"]}
+    return state, summary
+
+
 def render_facts(facts: list[dict[str, Any]], backend: str, state_version: int) -> str:
     payload = {
         "backend": backend,
@@ -202,6 +339,9 @@ class FileMemoryBackend:
             raise MemoryError(f"memory state missing: {self.state_file}")
         return json.loads(self.state_file.read_text(encoding="utf-8"))
 
+    def load_state(self) -> dict[str, Any]:
+        return self._load()
+
     def _save(self, state: dict[str, Any]) -> None:
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -235,67 +375,11 @@ class FileMemoryBackend:
 
     def apply(self, batch: dict[str, Any], injected_ids: list[str], task_id: str) -> dict[str, Any]:
         started = time.monotonic()
-        batch = validate_batch(batch, injected_ids, task_id)
-        state = self._load()
-        before = state["state_version"]
-        counts = {"create": 0, "update": 0, "stale": 0, "noop": 0}
-        gotchas = 0
-        produced = []
-        for item in batch["mutations"]:
-            op = item["op"]
-            fact_id = item.get("fact_id") or (item.get("fact") or {})["fact_id"]
-            counts[op] += 1
-            if op == "noop":
-                continue
-            if op == "create":
-                if fact_id in state["facts"]:
-                    raise MemoryError(f"create collides with existing {fact_id}")
-                fact = dict(item.get("fact") or {})
-                fact.setdefault("fact_id", fact_id)
-                prefix = fact_id.split(":")[1].split("-")[0]
-                if prefix not in PREFIX_SLICES:
-                    raise MemoryError(f"unknown fact prefix: {fact_id}")
-                fact.setdefault("slice", PREFIX_SLICES[prefix])
-                fact.setdefault("object_type", SLICE_OBJECTS[fact["slice"]])
-                fact.setdefault("status", "candidate")
-                fact.setdefault("confidence", "low")
-                fact.setdefault("provenance", "inferred")
-                fact.setdefault("source", "task")
-                fact.setdefault("evidence", [])
-                fact.setdefault("created_at", utcnow())
-                if not fact.get("evidence"):
-                    raise MemoryError(f"new fact has no evidence: {fact_id}")
-                fact.setdefault("content", fact.get("statement", ""))
-                state["facts"][fact_id] = fact
-                gotchas += fact.get("slice") == "gotchas"
-            else:
-                if fact_id not in state["facts"]:
-                    raise MemoryError(f"{op} targets missing {fact_id}")
-                values = dict(item.get("values") or {})
-                if op == "stale":
-                    values["status"] = "stale"
-                    if not values.get("status_reason"):
-                        raise MemoryError(f"stale needs status_reason: {fact_id}")
-                state["facts"][fact_id].update(values)
-            produced.append(fact_id)
-        state["tasks"][task_id] = {
-            **batch["task"], "at": utcnow(), "used_facts": batch["task"].get("used_facts", []),
-            "produced_facts": batch["task"].get("produced_facts", []),
-        }
-        state["state_version"] += 1
-        state["journal"].append({
-            "kind": "task_write", "task_id": task_id, "at": utcnow(),
-            "version_before": before, "version_after": state["state_version"],
-            "counts": counts, "used_facts": state["tasks"][task_id]["used_facts"],
-            "produced_facts": state["tasks"][task_id]["produced_facts"],
-        })
+        state, summary = apply_batch_to_state(self._load(), batch, injected_ids, task_id)
         self._save(state)
         return {
             "backend": self.name, "fallback": True, "ok": True,
-            "state_version_before": before, "state_version_after": state["state_version"],
-            "mutations": counts, "gotchas": gotchas, "schema_changes": 0,
-            "used_facts": state["tasks"][task_id]["used_facts"],
-            "produced_facts": state["tasks"][task_id]["produced_facts"],
+            **summary, "schema_changes": 0,
             "wall_sec": round(time.monotonic() - started, 4), "provider_usage": None,
             "provider_calls": 0,
         }
@@ -339,97 +423,191 @@ class FileMemoryBackend:
         return checkpoint
 
 
-class XMemoryBackend(FileMemoryBackend):
-    """xmemory adapter with a local audit shadow.
+class SubprocessXMemoryTransport:
+    """Production transport; the helper owns credentials and HTTP response parsing."""
 
-    Provisioning is intentionally explicit: every stream gets a different pre-created
-    instance id.  `provision_xmemory.py` creates those instances from one C0 schema and
-    structured-mutation seed; no shared live instance is accepted.
+    def __init__(self, xmemcli: str = "xmemcli"):
+        self.xmemcli = xmemcli
+        self.helper = Path(__file__).with_name("provision_xmemory.py")
+
+    def _helper(self, args: list[str], payload: dict[str, Any] | None = None,
+                timeout: int = 420) -> tuple[dict[str, Any], float]:
+        started = time.monotonic()
+        command = [sys.executable, str(self.helper), *args]
+        p = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
+                           text=True, capture_output=True, timeout=timeout)
+        if p.returncode:
+            raise MemoryError(f"xmemory helper {' '.join(args[:2])} failed: {p.stderr[-1600:]}")
+        try:
+            return json.loads(p.stdout), time.monotonic() - started
+        except json.JSONDecodeError as exc:
+            raise MemoryError(f"xmemory helper returned invalid JSON: {p.stdout[-1200:]}") from exc
+
+    def clone(self, parent_id: str, name: str, mode: str, seed: int,
+              session_id: str) -> tuple[str, dict[str, Any]]:
+        doc, wall = self._helper(["clone", "--parent", parent_id, "--name", name,
+                                  "--mode", mode, "--seed", str(seed),
+                                  "--session-id", session_id, "--xmemcli", self.xmemcli])
+        return doc["instance_id"], {**doc, "wall_sec": round(wall, 4)}
+
+    def load_state(self, instance_id: str) -> dict[str, Any]:
+        doc, _ = self._helper(["state", "--instance", instance_id])
+        return doc["state"]
+
+    def retrieve(self, instance_id: str, task_id: str, slices: list[str], query: str,
+                 top_k: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        doc, wall = self._helper(["read-facts", "--instance", instance_id,
+                                  "--task", task_id, "--top-k", str(top_k),
+                                  "--slices", *slices], {"query": query})
+        return doc["facts"], {**doc.get("metrics", {}), "wall_sec": round(wall, 4)}
+
+    def write(self, instance_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        doc, wall = self._helper(["write", "--instance", instance_id], payload)
+        return {**doc, "wall_sec": round(wall, 4)}
+
+
+class XMemoryBackend:
+    """Cloud-only xmemory lineage: one fresh child instance per agent session.
+
+    The local lineage file contains only remote ids and hashes. Facts, tasks, lifecycle,
+    journal and the canonical clone manifest live inside xmemory's typed MemoryState object.
     """
 
     name = "xmemory"
 
     def __init__(self, state_dir: Path, snapshot: Path, mode: str, seed: int,
-                 instance_id: str, xmemcli: str = "xmemcli"):
-        super().__init__(state_dir, snapshot, mode, seed)
-        self.instance_id = instance_id
+                 c0_instance_id: str, session_id: str, xmemcli: str = "xmemcli",
+                 name_prefix: str = "kata", transport: Any | None = None):
+        self.state_dir = state_dir
+        self.lineage_file = state_dir / "lineage.json"
+        self.snapshot = snapshot
+        self.mode = mode
+        self.seed = seed
+        self.c0_instance_id = c0_instance_id
+        self.session_id = session_id
+        self.name_prefix = name_prefix
+        self.transport = transport or SubprocessXMemoryTransport(xmemcli)
         self.xmemcli = xmemcli
+        self.instance_id = ""
+        self.parent_instance_id = ""
+        self.clone_metrics: dict[str, Any] = {}
+
+    def _lineage(self) -> dict[str, Any]:
+        if not self.lineage_file.exists():
+            return {"format_version": 1, "mode": self.mode, "seed": self.seed,
+                    "c0_instance_id": self.c0_instance_id, "sessions": []}
+        return json.loads(self.lineage_file.read_text(encoding="utf-8"))
+
+    def _save_lineage(self, lineage: dict[str, Any]) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.lineage_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, self.lineage_file)
 
     def prepare(self, reset: bool = False) -> dict[str, Any]:
-        if reset and self.state_file.exists():
-            raise MemoryError(
-                "cannot reset a remote xmemory instance in place; provision a fresh unique "
-                "instance id and use a new output/state directory")
-        state = super().prepare(reset=reset)
-        if not self.instance_id:
-            raise MemoryError("xmemory backend requires a unique instance_id for this mode/seed")
-        recorded = state.get("xmemory_instance_id")
-        if recorded and recorded != self.instance_id:
-            raise MemoryError("xmemory audit shadow points at a different instance")
-        state["backend"] = self.name
-        state["fallback"] = False
-        state["xmemory_instance_id"] = self.instance_id
-        self._save(state)
+        if self.instance_id:
+            return self.load_state()
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if reset and self.lineage_file.exists():
+            self.lineage_file.unlink()
+        lineage = self._lineage()
+        if (lineage["mode"], lineage["seed"], lineage["c0_instance_id"]) != (
+                self.mode, self.seed, self.c0_instance_id):
+            raise MemoryError("xmemory lineage belongs to another mode/seed/C0")
+        self.parent_instance_id = (lineage["sessions"][-1]["instance_id"]
+                                   if lineage["sessions"] else self.c0_instance_id)
+        if not self.parent_instance_id:
+            raise MemoryError("xmemory requires memory.c0_instance_id")
+        suffix = uuid.uuid4().hex[:8]
+        safe_mode = self.mode.replace("+", "-")
+        name = f"{self.name_prefix}-{safe_mode}-s{self.seed}-{self.session_id}-{suffix}"
+        self.instance_id, self.clone_metrics = self.transport.clone(
+            self.parent_instance_id, name, self.mode, self.seed, self.session_id)
+        state = self.load_state()
+        expected = hashlib.sha256(self.snapshot.read_bytes()).hexdigest()
+        if state.get("c0_sha256") != expected:
+            raise MemoryError("cloud child was not cloned from configured C0")
+        entry = {"session_id": self.session_id, "parent_instance_id": self.parent_instance_id,
+                 "instance_id": self.instance_id, "state_version": state["state_version"],
+                 "state_sha256": state_sha256(state), "created_at": utcnow()}
+        lineage["sessions"].append(entry)
+        self._save_lineage(lineage)
         return state
 
-    def _cmd(self, args: list[str], timeout: int = 180) -> tuple[str, float]:
-        started = time.monotonic()
-        p = subprocess.run([self.xmemcli, "--json", "--instance-id", self.instance_id, *args],
-                           text=True, capture_output=True, timeout=timeout)
-        wall = time.monotonic() - started
-        if p.returncode:
-            raise MemoryError(f"xmemcli {' '.join(args[:2])} failed: {p.stderr[-1200:]}")
-        return p.stdout, wall
+    def load_state(self) -> dict[str, Any]:
+        if not self.instance_id:
+            raise MemoryError("xmemory session instance is not prepared")
+        state = self.transport.load_state(self.instance_id)
+        if state_sha256(state) != state_object(state)["snapshot_sha256"]:
+            raise MemoryError("remote MemoryState digest verification failed")
+        return state
 
     def read(self, task_id: str, slices: list[str], query: str, top_k: int = 20) -> ReadResult:
-        object_types = [SLICE_OBJECTS[s] for s in slices]
-        prompt = (f"Return at most {top_k} active technical facts relevant to task {task_id}. "
-                  f"Only object types {object_types}. Include exact fact_id, statement, evidence, "
-                  f"human_notes and status. Task: {query}")
-        output, wall = self._cmd(["read", prompt, "--read-mode", "raw"])
-        provider_ids = list(dict.fromkeys(FACT_ID_RE.findall(output)))
-        # The provider chooses IDs; the audit shadow enforces active/slice boundaries and renders
-        # deterministic exact content so a stale row can never be injected accidentally.
-        state = self._load()
-        facts = [state["facts"][i] for i in provider_ids if i in state["facts"]
-                 and state["facts"][i].get("status") == "active"
-                 and state["facts"][i].get("slice") in slices][:top_k]
+        state = self.load_state()
+        facts, provider = self.transport.retrieve(
+            self.instance_id, task_id, slices, query, top_k)
+        filtered = []
+        for fact in facts:
+            fact_id = fact.get("fact_id", "")
+            prefix = fact_id.split(":")[1].split("-")[0] if ":" in fact_id else ""
+            fact.setdefault("slice", PREFIX_SLICES.get(prefix))
+            fact.setdefault("object_type", SLICE_OBJECTS.get(fact.get("slice", "")))
+            for key in ("evidence", "human_notes"):
+                if isinstance(fact.get(key), str):
+                    try:
+                        fact[key] = json.loads(fact[key])
+                    except json.JSONDecodeError:
+                        pass
+            if fact.get("status") == "active" and fact.get("slice") in slices:
+                filtered.append(fact)
+        facts = filtered[:top_k]
         ids = [f["fact_id"] for f in facts]
         exact = render_facts(facts, self.name, state["state_version"])
         chars = len(exact)
         return ReadResult(facts, exact, {
             "backend": self.name, "fallback": False, "instance_id": self.instance_id,
+            "parent_instance_id": self.parent_instance_id,
+            "session_instance_created": True, "clone": self.clone_metrics,
             "state_version": state["state_version"], "fact_ids": ids,
-            "provider_fact_ids": provider_ids,
-            "provider_response_sha256": hashlib.sha256(output.encode()).hexdigest(),
-            "provider_response_chars": len(output),
+            "provider_fact_ids": provider.get("provider_fact_ids", ids),
+            "provider_response_sha256": provider.get("provider_response_sha256"),
+            "provider_response_chars": provider.get("provider_response_chars"),
             "fact_statuses": {f["fact_id"]: f.get("status") for f in facts},
             "facts_count": len(ids), "chars": chars, "estimated_tokens": _tokens(chars),
-            "wall_sec": round(wall, 4), "provider_usage": None,
-            "provider_calls": 1,
+            "wall_sec": provider.get("wall_sec", 0.0), "provider_usage": None,
+            "provider_calls": provider.get("provider_calls", 1),
+            "clone_provider_calls": self.clone_metrics.get("provider_calls"),
         })
 
     def apply(self, batch: dict[str, Any], injected_ids: list[str], task_id: str) -> dict[str, Any]:
-        normalized = validate_batch(batch, injected_ids, task_id)
-        payload = to_xmemory_mutations(normalized)
         started = time.monotonic()
-        if payload["structured_mutations"]:
-            # xmemcli does not expose structured writes; use the same authenticated API path
-            # through the small provision helper, which reads credentials without logging them.
-            helper = Path(__file__).with_name("provision_xmemory.py")
-            p = subprocess.run([os.environ.get("PYTHON", "python3"), str(helper), "write",
-                                "--instance", self.instance_id], input=json.dumps(payload),
-                               text=True, capture_output=True, timeout=180)
-            if p.returncode:
-                raise MemoryError(f"xmemory structured write failed: {p.stderr[-1200:]}")
-        result = super().apply(normalized, injected_ids, task_id)
-        result.update({"backend": self.name, "fallback": False,
-                       "instance_id": self.instance_id,
-                       "provider_calls": 1 if payload["structured_mutations"] else 0,
-                       "wall_sec": round(time.monotonic() - started, 4)})
-        return result
+        normalized = validate_batch(batch, injected_ids, task_id)
+        next_state, summary = apply_batch_to_state(
+            self.load_state(), normalized, injected_ids, task_id)
+        payload = to_xmemory_mutations(normalized)
+        payload["structured_mutations"].append(manifest_update_mutation(next_state))
+        provider = self.transport.write(self.instance_id, payload)
+        verified = self.load_state()
+        if state_sha256(verified) != state_sha256(next_state):
+            raise MemoryError("xmemory write committed but remote manifest does not match")
+        return {"backend": self.name, "fallback": False, "ok": True, **summary,
+                "schema_changes": 0, "instance_id": self.instance_id,
+                "parent_instance_id": self.parent_instance_id,
+                "provider_calls": provider.get("provider_calls", 1),
+                "wall_sec": round(time.monotonic() - started, 4),
+                "remote_state_sha256": state_sha256(verified)}
+
+    def _cmd(self, args: list[str], timeout: int = 180) -> tuple[str, float]:
+        started = time.monotonic()
+        p = subprocess.run([self.xmemcli, "--json", "--instance-id", self.instance_id, *args],
+                           text=True, capture_output=True, timeout=timeout)
+        if p.returncode:
+            raise MemoryError(f"xmemcli {' '.join(args[:2])} failed: {p.stderr[-1200:]}")
+        return p.stdout, time.monotonic() - started
 
     def review_schema_suggestions(self) -> dict[str, Any]:
+        if hasattr(self.transport, "review_schema_suggestions"):
+            return self.transport.review_schema_suggestions(self.instance_id)
         output, wall = self._cmd(["schema", "suggestions", "review"], timeout=360)
         try:
             payload = json.loads(output)
@@ -438,32 +616,28 @@ class XMemoryBackend(FileMemoryBackend):
         return {"payload": payload, "wall_sec": round(wall, 4)}
 
     def evolve(self, report: dict[str, Any]) -> dict[str, Any]:
+        state = self.load_state()
+        before = state["state_version"]
+        schema_before = state["schema_version"]
         mutations = []
         for item in report.get("mutations", []):
+            if item.get("op") not in {"update", "stale", "noop"}:
+                raise MemoryError("evolution cannot create solution facts")
             if item.get("op") == "noop":
                 continue
             fact_id = item.get("fact_id", "")
-            prefix = fact_id.split(":")[1].split("-")[0] if ":" in fact_id else ""
-            slice_name = PREFIX_SLICES.get(prefix)
-            if not slice_name:
-                raise MemoryError(f"unknown evolution fact id: {fact_id}")
+            if fact_id not in state["facts"]:
+                raise MemoryError(f"evolution targets missing {fact_id}")
             values = dict(item.get("values") or {})
             if item.get("op") == "stale":
                 values["status"] = "stale"
-            for key in ("evidence", "human_notes"):
-                if isinstance(values.get(key), (list, dict)):
-                    values[key] = json.dumps(values[key], ensure_ascii=False)
-            mutations.append({"object_mutation": {"object_type": SLICE_OBJECTS[slice_name],
-                                                    "update": {"key": {"fact_id": fact_id},
-                                                               "values": values}}})
-        if mutations:
-            helper = Path(__file__).with_name("provision_xmemory.py")
-            p = subprocess.run([os.environ.get("PYTHON", "python3"), str(helper), "write",
-                                "--instance", self.instance_id],
-                               input=json.dumps({"structured_mutations": mutations}), text=True,
-                               capture_output=True, timeout=180)
-            if p.returncode:
-                raise MemoryError(f"xmemory evolution write failed: {p.stderr[-1200:]}")
+                if not values.get("status_reason"):
+                    raise MemoryError("evolution stale needs status_reason")
+            state["facts"][fact_id].update(values)
+            remote_values = {key: _json_field(value) for key, value in values.items()}
+            mutations.append({"object_mutation": {
+                "object_type": state["facts"][fact_id]["object_type"], "update": {
+                    "key": {"fact_id": fact_id}, "values": remote_values}}})
 
         decisions = report.get("schema_suggestion_decisions", [])
         proposal = report.get("proposal_version")
@@ -480,15 +654,30 @@ class XMemoryBackend(FileMemoryBackend):
             self._cmd(args, timeout=180)
         if report.get("apply_schema_suggestions"):
             if not proposal or not report.get("confirm_destructive_preview_reviewed"):
-                raise MemoryError("schema apply requires proposal_version and explicit preview confirmation")
+                raise MemoryError("schema apply requires proposal version and preview confirmation")
             self._cmd(["schema", "suggestions", "apply", "--proposal-version", proposal,
                        "--confirm-destructive"], timeout=360)
             schema_applied = True
-        local_report = dict(report)
-        local_report["schema_changes"] = (report.get("schema_changes", [])
-                                          if schema_applied else [])
-        checkpoint = super().evolve(local_report)
-        checkpoint["xmemory_schema_applied"] = schema_applied
+            state["schema_version"] += 1
+            state["schema_history"].append({"at": utcnow(),
+                                            "changes": report.get("schema_changes", []),
+                                            "source": "evolution"})
+        state["state_version"] += 1
+        checkpoint = {"checkpoint": "after-a3-before-a4", "at": utcnow(),
+                      "state_version_before": before,
+                      "state_version_after": state["state_version"],
+                      "schema_version_before": schema_before,
+                      "schema_version_after": state["schema_version"],
+                      "mutations": report.get("mutations", []),
+                      "schema_changes": report.get("schema_changes", []) if schema_applied else [],
+                      "report": report.get("report", ""),
+                      "xmemory_schema_applied": schema_applied}
+        state["evolution_checkpoints"].append(checkpoint)
+        state["journal"].append({"kind": "evolve", **checkpoint})
+        mutations.append(manifest_update_mutation(state))
+        self.transport.write(self.instance_id, {"structured_mutations": mutations})
+        if state_sha256(self.load_state()) != state_sha256(state):
+            raise MemoryError("xmemory evolution manifest verification failed")
         return checkpoint
 
 
@@ -518,7 +707,10 @@ def to_xmemory_mutations(batch: dict[str, Any]) -> dict[str, Any]:
     if task:
         out.append({"object_mutation": {"object_type": "Task", "create": {
             "key": {"task_id": task["task_id"]},
-            "values": {"title": task.get("title", task["task_id"]), "at": utcnow()}}}})
+            "values": {"title": task.get("title", task["task_id"]), "at": utcnow(),
+                       "used_facts": _json_field(task.get("used_facts", [])),
+                       "produced_facts": _json_field(task.get("produced_facts", [])),
+                       "decisions": _json_field(task.get("decisions", []))}}}})
         for verb, ids in (("used", task.get("used_facts", [])),
                           ("produced", task.get("produced_facts", []))):
             for fact_id in ids:
@@ -536,15 +728,15 @@ def to_xmemory_mutations(batch: dict[str, Any]) -> dict[str, Any]:
 
 
 def open_backend(cfg: dict[str, Any], state_dir: Path, snapshot: Path,
-                 mode: str, seed: int) -> FileMemoryBackend:
+                 mode: str, seed: int, session_id: str = "session",
+                 transport: Any | None = None) -> Any:
     memory = cfg.get("memory", {})
     backend = memory.get("backend", "file")
     if backend == "file":
         return FileMemoryBackend(state_dir, snapshot, mode, seed)
     if backend == "xmemory":
-        key = f"{mode}.seed{seed}"
-        instances = memory.get("xmemory_instances", {})
-        instance_id = instances.get(key, "")
-        return XMemoryBackend(state_dir, snapshot, mode, seed, instance_id,
-                              memory.get("xmemcli", "xmemcli"))
+        return XMemoryBackend(
+            state_dir, snapshot, mode, seed, memory.get("c0_instance_id", ""), session_id,
+            memory.get("xmemcli", "xmemcli"), memory.get("instance_name_prefix", "kata"),
+            transport=transport)
     raise MemoryError(f"unknown memory.backend={backend}")

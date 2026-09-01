@@ -54,7 +54,8 @@ uv run pytest tests/unit_tests/test_config.py -q  # проверка: 55 passed
 однокоммитный workspace; agent diff предыдущей задачи не накатывается на следующую. Но memory-on
 streams теперь намеренно хронологические: write-back задачи переживает новую сессию и читается
 следующей задачей. Поэтому порядок `a1→a2→a3→[evolve]→a4→a5→a6` значим для памяти, а каждый
-mode/seed использует отдельный clone C0.
+mode/seed образует отдельную cloud lineage: новый xmemory child на каждую coding/curator-сессию,
+начиная с общего read-only C0 template.
 
 Побочный эффект, который надо знать: память собрана на 10.05, а базы задач доходят до 25.08. Для `a5` и `a6` факты протухли на три с половиной месяца — то есть на поздних задачах гипотеза проверяется частично неверной памятью. На этапе 1 это шум в сторону нулевой дельты, и об этом честнее сказать самим. На этапе 2 это же становится материалом: есть что актуализировать, и видно на данных.
 
@@ -64,7 +65,7 @@ mode/seed использует отдельный clone C0.
 Три повтора — минимум для median/range. До неё обязателен canary a3/a6 одним seed; полный платный
 sweep без подтверждения бюджета не запускается.
 
-Для bulk/reproducible матрицы разрешён file backend с теми же lifecycle/provenance semantics и
-явным `fallback=true`. Для настоящего demo/evolve используется xmemory: read, structured write и
-schema-suggestion calls считаются отдельно от coding-agent usage. Полный xmemory sweep не
-запускается без предварительного canary и подтверждения бюджета.
+Официальные memory-строки требуют xmemory; file backend оставлен только для бесплатных selftests.
+Каждая memory-сессия создаёт свежий child из предыдущего cloud instance, после чего read,
+structured write и schema-suggestion calls считаются отдельно от coding-agent usage. Полный
+xmemory sweep не запускается без предварительного canary и подтверждения бюджета.

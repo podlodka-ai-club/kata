@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def prompt() -> str:
     return """You are the memory curator, not a coding agent. This is the checkpoint after a3
 and before a4. You cannot see a repository, future tasks, solution commits, or hidden tests.
-Review only memory_state.json: candidates, gotchas, questions, contradictions and duplicate facts.
+Review only cloud_memory_state.json, exported for this isolated session from its fresh xmemory
+child: candidates, gotchas, questions, contradictions and duplicate facts.
 Code evidence recorded in facts wins over memory prose. You may update or stale existing facts;
 you must not create coding-solution facts. Propose only additive, domain-typed schema changes.
 Write evolution_report.json with this exact shape:
@@ -65,9 +66,10 @@ def main() -> int:
 
     cfg = tomllib.loads((ROOT / args.config).read_text(encoding="utf-8"))
     snapshot = (ROOT / cfg["memory"]["snapshot"]).resolve()
-    backend = open_backend(cfg, (ROOT / args.memory_state).resolve(), snapshot, args.mode, args.seed)
+    backend = open_backend(cfg, (ROOT / args.memory_state).resolve(), snapshot, args.mode, args.seed,
+                           session_id="evolve-after-a3")
     backend.prepare(reset=False)
-    state = backend._load()  # audit shadow is the curator input for both adapters
+    state = backend.load_state()
     schema_review = None
     if hasattr(backend, "review_schema_suggestions"):
         schema_review = backend.review_schema_suggestions()
@@ -85,7 +87,7 @@ def main() -> int:
     else:
         wt = Path(tempfile.mkdtemp(prefix="kata-evolution-"))
         try:
-            (wt / "memory_state.json").write_text(
+            (wt / "cloud_memory_state.json").write_text(
                 json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
             settings = {"sandbox": {"enabled": True, "failIfUnavailable": True,
                                      "allowUnsandboxedCommands": False,
@@ -121,6 +123,8 @@ def main() -> int:
         return 2
     artifact = {
         "mode": args.mode, "seed": args.seed, "agent": kind,
+        "instance_id": getattr(backend, "instance_id", None),
+        "parent_instance_id": getattr(backend, "parent_instance_id", None),
         "rc": rc, "usage": usage, "usage_parsed": usage_parsed,
         "wall_sec": round(wall, 3), "state_version_before": before,
         "backend_wall_sec": round(backend_wall, 3),

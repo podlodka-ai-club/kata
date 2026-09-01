@@ -51,20 +51,19 @@ cmd = [
 timeout_sec = 3600
 
 [memory]
-# Primary demo/evolve path: xmemory. Reproducible bulk fallback: file.
-# File is not a naive Markdown dump: it preserves lifecycle, Task relations,
-# versioning, isolation and write->read durability, but is explicitly reported as fallback=true.
-backend = "file"                       # file | xmemory
+# Hackathon path: xmemory is the only state carried between sessions. File remains
+# available only for free selftests/local debugging and is always fallback=true.
+backend = "xmemory"                    # xmemory | file
+require_xmemory_for_memory_modes = true
 snapshot = "dataset/facts/snapshot-c0.md"
 retrieval = "task-slices"
 top_k = 20
 xmemcli = "xmemcli"
+instance_name_prefix = "kata"
+
+# Provision once with provision_xmemory.py. This template is never mutated. Each
+# coding/curator session auto-creates a fresh child from the previous cloud instance.
+c0_instance_id = "<c0-template-instance-id>"
 
 # Required in both memory-on streams. Coding usage and memory read/write usage are logged separately.
 write_back = true
-
-# For backend="xmemory", provision a UNIQUE instance from the same C0 for every
-# memory mode/seed and paste the returned ids here. The runner rejects missing ids.
-[memory.xmemory_instances]
-# "memory-on.seed1" = "..."
-# "memory-on+evolve.seed1" = "..."

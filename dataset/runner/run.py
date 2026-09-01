@@ -448,7 +448,7 @@ def capture_diff(wt: Path, run_dir: Path, exclude: list[str] | None = None) -> d
     _, diff, _ = sh(["git", "diff", "--cached"], cwd=wt)
     (run_dir / "diff.patch").write_text(diff, encoding="utf-8")
     _, stat, _ = sh(["git", "diff", "--cached", "--numstat"], cwd=wt)
-    rows = [l.split("\t") for l in stat.splitlines() if l.strip()]
+    rows = [line.split("\t") for line in stat.splitlines() if line.strip()]
     touched = [r[2] for r in rows if len(r) == 3]
     _, status, _ = sh(["git", "diff", "--cached", "--name-status"], cwd=wt)
     test_changes = {"added": [], "modified_existing": [], "deleted_existing": []}
@@ -589,6 +589,11 @@ def main() -> int:
     kind = args.agent or cfg["agent"]["kind"]
     memory_on = args.mode != "memory-off"
     write_back = memory_on and bool(cfg.get("memory", {}).get("write_back", True))
+    if (memory_on and cfg.get("memory", {}).get("require_xmemory_for_memory_modes", True)
+            and cfg.get("memory", {}).get("backend") != "xmemory"):
+        print("[memory] official memory modes require backend=xmemory; "
+              "file is selftest-only", file=sys.stderr)
+        return 3
 
     run_dir = ROOT / args.out / task.id / args.mode / f"seed{args.seed}"
     if run_dir.exists():
@@ -615,7 +620,8 @@ def main() -> int:
         state_dir = ((ROOT / args.memory_state).resolve() if args.memory_state else
                      (ROOT / args.out / "_memory" / args.mode / f"seed{args.seed}").resolve())
         try:
-            memory_backend = open_backend(cfg, state_dir, snapshot, args.mode, args.seed)
+            memory_backend = open_backend(cfg, state_dir, snapshot, args.mode, args.seed,
+                                          session_id=task.id)
             memory_backend.prepare(reset=args.reset_memory)
             memory_read = memory_backend.read(task.id, task.slices,
                                               f"{task.title}\n{task.prompt}",

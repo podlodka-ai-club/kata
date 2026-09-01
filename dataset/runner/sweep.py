@@ -83,6 +83,8 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
             "cache_creation_tokens", "total_cost_usd", "num_turns", "agent_touched_tests",
             "retrieval_backend", "retrieval_fallback", "injected_fact_ids", "context_chars",
             "context_tokens", "retrieval_precision", "retrieval_coverage", "irrelevant_facts",
+            "memory_instance_id", "memory_parent_instance_id", "memory_session_instance_created",
+            "memory_clone_wall_sec", "memory_clone_provider_calls",
             "memory_state_before", "memory_state_after", "memory_creates", "memory_updates",
             "memory_stale", "memory_noop", "memory_gotchas", "memory_schema_changes",
             "memory_read_wall_sec", "memory_write_wall_sec", "memory_read_provider_calls",
@@ -157,6 +159,11 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
                 "retrieval_precision": retrieval.get("precision"),
                 "retrieval_coverage": retrieval.get("coverage"),
                 "irrelevant_facts": retrieval.get("irrelevant_count"),
+                "memory_instance_id": retrieval.get("instance_id"),
+                "memory_parent_instance_id": retrieval.get("parent_instance_id"),
+                "memory_session_instance_created": retrieval.get("session_instance_created"),
+                "memory_clone_wall_sec": (retrieval.get("clone") or {}).get("wall_sec"),
+                "memory_clone_provider_calls": retrieval.get("clone_provider_calls"),
                 "memory_state_before": write.get("state_version_before", retrieval.get("state_version")),
                 "memory_state_after": write.get("state_version_after"),
                 "memory_creates": mutations.get("create"), "memory_updates": mutations.get("update"),
@@ -276,14 +283,9 @@ def main() -> int:
     modes_requested = args.modes
     cfg = tomllib.loads((ROOT / args.config).read_text(encoding="utf-8"))
     if cfg.get("memory", {}).get("backend") == "xmemory":
-        mapping = cfg["memory"].get("xmemory_instances", {})
-        keys = [f"{mode}.seed{seed}" for mode in modes_requested if mode != "memory-off"
-                for seed in range(1, args.seeds + 1)]
-        missing_instances = [key for key in keys if not mapping.get(key)]
-        ids_in_use = [mapping[key] for key in keys if mapping.get(key)]
-        if missing_instances or len(ids_in_use) != len(set(ids_in_use)):
-            print(f"[memory] xmemory isolation failed: missing={missing_instances}, "
-                  f"duplicate_instance_ids={len(ids_in_use) != len(set(ids_in_use))}")
+        c0_instance = cfg["memory"].get("c0_instance_id")
+        if not c0_instance:
+            print("[memory] xmemory cloud lineage requires memory.c0_instance_id")
             return 3
     expected = {(task, mode, seed) for task in ids for mode in modes_requested
                 for seed in range(1, args.seeds + 1)}

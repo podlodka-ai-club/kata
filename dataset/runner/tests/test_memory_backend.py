@@ -13,7 +13,13 @@ RUNNER = Path(__file__).resolve().parents[1]
 ROOT = RUNNER.parents[1]
 sys.path.insert(0, str(RUNNER))
 
-from memory_backend import FileMemoryBackend, MemoryError, to_xmemory_mutations  # noqa: E402
+from memory_backend import (  # noqa: E402
+    FileMemoryBackend, MemoryError, XMemoryBackend, new_state, state_seed_payload,
+    state_sha256, to_xmemory_mutations,
+)
+from provision_xmemory import (  # noqa: E402
+    facts_from_read_response, schema as xmemory_schema, state_from_read_response,
+)
 from run import analytical_eligibility, feature_lift  # noqa: E402
 
 
@@ -122,6 +128,130 @@ class MemoryStateMachineTest(unittest.TestCase):
                           for m in translated["structured_mutations"] if "relation_mutation" in m]
         self.assertIn("task_used_data_ownership", relation_types)
         self.assertIn("task_produced_gotcha", relation_types)
+
+
+class FakeCloudTransport:
+    def __init__(self):
+        template = new_state(SNAPSHOT, "template", 0, "xmemory")
+        template["fallback"] = False
+        template["lineage"] = {"parent_instance_id": "", "session_id": "c0-template",
+                               "session_kind": "template"}
+        self.instances = {"c0": template}
+        self.clones = []
+
+    def clone(self, parent_id, name, mode, seed, session_id):
+        state = json.loads(json.dumps(self.instances[parent_id]))
+        child = f"instance-{len(self.instances)}"
+        state.update({"backend": "xmemory", "fallback": False, "mode": mode, "seed": seed})
+        state["lineage"] = {"parent_instance_id": parent_id, "session_id": session_id,
+                            "session_kind": "curator" if session_id.startswith("evolve") else "coding"}
+        self.instances[child] = state
+        self.clones.append((parent_id, child, session_id))
+        return child, {"parent_instance_id": parent_id, "provider_calls": 5,
+                       "state_sha256": state_sha256(state)}
+
+    def load_state(self, instance_id):
+        return json.loads(json.dumps(self.instances[instance_id]))
+
+    def retrieve(self, instance_id, task_id, slices, query, top_k):
+        state = self.instances[instance_id]
+        facts = [json.loads(json.dumps(f)) for f in state["facts"].values()
+                 if f.get("status") == "active" and f.get("slice") in slices]
+        words = {w for w in query.lower().split() if len(w) > 3}
+        facts.sort(key=lambda f: (-sum(w in f.get("content", "").lower() for w in words),
+                                  f["fact_id"]))
+        return facts[:top_k], {"provider_fact_ids": [f["fact_id"] for f in facts[:top_k]],
+                               "provider_calls": 1, "wall_sec": 0.0}
+
+    def write(self, instance_id, payload):
+        manifest = payload["structured_mutations"][-1]["object_mutation"]["update"]
+        self.instances[instance_id] = json.loads(manifest["values"]["snapshot_json"])
+        return {"provider_calls": 1, "wall_sec": 0.0}
+
+    def review_schema_suggestions(self, instance_id):
+        return {"payload": {"suggestions": []}, "wall_sec": 0.0}
+
+
+class XMemoryCloudLineageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.transport = FakeCloudTransport()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def backend(self, session, mode="memory-on", seed=1):
+        return XMemoryBackend(self.root / mode / f"seed{seed}", SNAPSHOT, mode, seed,
+                              "c0", session, transport=self.transport)
+
+    def test_every_session_gets_fresh_cloud_child_and_no_local_fact_state(self):
+        a1 = self.backend("a1")
+        a1.prepare(reset=True)
+        read1 = a1.read("a1", ["api-contracts"], "shared mixin")
+        a1.apply(active_batch("a1", read1.metrics["fact_ids"]),
+                 read1.metrics["fact_ids"], "a1")
+
+        a2 = self.backend("a2")
+        state2 = a2.prepare()
+        read2 = a2.read("a2", ["api-contracts"], "shared mixin conflict")
+        self.assertNotEqual(a1.instance_id, a2.instance_id)
+        self.assertEqual(a2.parent_instance_id, a1.instance_id)
+        self.assertIn("fact:ac-9001", read2.metrics["fact_ids"])
+        self.assertEqual(state2["tasks"]["a1"]["produced_facts"], ["fact:ac-9001"])
+        self.assertFalse((self.root / "memory-on" / "seed1" / "state.json").exists())
+        lineage = json.loads((self.root / "memory-on" / "seed1" / "lineage.json").read_text())
+        self.assertNotIn("facts", lineage)
+        self.assertEqual(len(lineage["sessions"]), 2)
+
+    def test_curator_is_a_fresh_child_and_next_session_reads_its_state(self):
+        a3 = self.backend("a3", "memory-on+evolve")
+        a3.prepare(reset=True)
+        read = a3.read("a3", ["api-contracts"], "conflict")
+        a3.apply({"mutations": [], "task": {"task_id": "a3", "title": "a3",
+                                                "used_facts": read.metrics["fact_ids"][:1],
+                                                "produced_facts": []}},
+                 read.metrics["fact_ids"], "a3")
+        evolve = self.backend("evolve-after-a3", "memory-on+evolve")
+        evolve.prepare()
+        checkpoint = evolve.evolve({"mutations": [], "schema_changes": [], "report": "ok"})
+        a4 = self.backend("a4", "memory-on+evolve")
+        state4 = a4.prepare()
+        self.assertEqual(evolve.parent_instance_id, a3.instance_id)
+        self.assertEqual(a4.parent_instance_id, evolve.instance_id)
+        self.assertEqual(checkpoint["state_version_after"], state4["state_version"])
+
+    def test_cloud_seed_is_typed_objects_relations_plus_manifest(self):
+        state = self.transport.instances["c0"]
+        payload = state_seed_payload(state)["structured_mutations"]
+        types = [m["object_mutation"]["object_type"] for m in payload
+                 if "object_mutation" in m]
+        self.assertIn("ApiContract", types)
+        self.assertIn("MemoryState", types)
+        manifest = payload[-1]["object_mutation"]["create"]
+        self.assertIn("snapshot_sha256", manifest["values"])
+        relation = xmemory_schema()["relations"]["task_used_api_contract"]
+        self.assertEqual(set(relation["objects"]), {"task", "api_contract"})
+        self.assertEqual(relation["keys"]["unique_pair"], ["task", "api_contract"])
+
+    def test_xresponse_contract_recovers_manifest_and_typed_facts(self):
+        state = self.transport.instances["c0"]
+        manifest_response = {"items": [{"reader_result": {"objects": [{
+            "object_type": "MemoryState", "key": {"stream_id": "stream"},
+            "values": {"snapshot_json": json.dumps(state),
+                       "snapshot_sha256": state_sha256(state)},
+        }], "relations": []}}], "errors": []}
+        self.assertEqual(state_from_read_response(manifest_response)["c0_sha256"],
+                         state["c0_sha256"])
+        fact = state["facts"]["fact:ac-0004"]
+        fact_response = {"items": [{"reader_result": {"objects": [{
+            "object_type": "ApiContract", "key": {"fact_id": fact["fact_id"]},
+            "values": {"statement": fact["statement"], "content": fact["content"],
+                       "status": "active", "evidence": json.dumps(fact["evidence"])},
+        }], "relations": []}}], "errors": []}
+        recovered = facts_from_read_response(fact_response, ["api-contracts"], 20)
+        self.assertEqual(recovered[0]["fact_id"], "fact:ac-0004")
+        self.assertEqual(recovered[0]["object_type"], "ApiContract")
 
 
 class AnalyticsTest(unittest.TestCase):
