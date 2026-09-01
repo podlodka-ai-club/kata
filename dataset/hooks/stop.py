@@ -30,12 +30,22 @@ INSTRUCTION = """\
    настройка) — новые candidate-факты с evidence вида файл:строка.
 3. На какие грабли наступил сам (упавшая сборка, поймавший регресс тест,
    требование проверки репозитория) — факт gotcha, только как гипотеза.
-4. Оставь след задачи: объект Task со связями used_facts и produced_facts
-   по fact_id, не прозой.
+4. Оставь след задачи: объект Task со связями used_facts и produced_facts по fact_id.
 
-Пиши одним structured_mutations-батчем. Не переписывай соседние факты «заодно» —
-то, что задача не трогала, идёт в сессию эволюции. Порог входа: факт должен
-пережить следующую задачу.
+Запиши один JSON-батч в `.kata-run/memory_mutations.json` (это `$KATA_RUN_DIR`). Формат:
+{"mutations":[{"op":"create","fact":{"fact_id":"fact:gt-....","slice":"gotchas",
+"statement":"...","content":"...","evidence":["файл:строка или лог"],"status":"candidate",
+"confidence":"low","provenance":"inferred","source":"task"}},
+{"op":"stale","fact_id":"fact:...","values":{"status_reason":"...","superseded_by":"fact:..."}},
+{"op":"update","fact_id":"fact:...","values":{"...":"..."}},
+{"op":"noop","fact_id":"fact:..."}],
+"task":{"task_id":"<KATA_TASK_ID>","title":"...","used_facts":["fact:..."],
+"produced_facts":["fact:..."],"decisions":[{"fact_id":"fact:...",
+"decision":"какое решение в коде изменил прочитанный факт","diff_paths":["path/to/file.py"]}]}}.
+Ссылаться в used_facts можно только на ID из стартового контекста. produced_facts — только ID
+реальных create/update/stale этого батча. Если устойчивых изменений нет, mutations может быть
+пустым, но Task и used_facts всё равно обязательны. Не переписывай соседние факты «заодно».
+Runner проверит схему и применит её через настроенный backend после завершения этой сессии.
 
 Когда закончишь — заверши сессию, повторно тебя не вернут.
 """
@@ -64,7 +74,8 @@ def main() -> int:
     marker.write_text("1", encoding="utf-8")
 
     # exit 2 = не останавливаться, вернуть агента в работу; stderr уезжает ему в контекст
-    print(INSTRUCTION, file=sys.stderr)
+    instruction = INSTRUCTION.replace("<KATA_TASK_ID>", os.environ.get("KATA_TASK_ID", "unknown"))
+    print(instruction, file=sys.stderr)
     return 2
 
 

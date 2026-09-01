@@ -8,5 +8,9 @@
 | --- | --- | ---: | --- | --- |
 | 2026-09-01 | Claude Sonnet 5, medium | 1 | [memory-off vs memory-on](2026-09-01-sonnet5-medium-seed1.md) | [CSV](2026-09-01-sonnet5-medium-seed1.csv) |
 
+Запись 2026-09-01 — сохранённый **naive full-snapshot negative control**: read-only memory,
+одинаковый полный dump для всех задач, один repeat. Новые task-relevant read/write/evolve
+результаты добавляются отдельными файлами и не переписывают этот baseline.
+
 Один seed — разведочный прогон, а не статистическое доказательство. Для финального сравнения
 нужны минимум три повтора после устранения методологических ограничений, описанных в отчёте.

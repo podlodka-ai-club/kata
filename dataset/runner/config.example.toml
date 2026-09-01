@@ -4,6 +4,7 @@
 [repo]
 url = "https://github.com/mealie-recipes/mealie.git"
 clone = ".cache/mealie"                 # reference clone; агент его историю не получает
+fetch = false                            # pinned commits already present; no network during eval
 
 # mealie везёт собственные агентские файлы. Если их не убрать, memory-off
 # на самом деле «с чужой памятью» и вся дельта схлопнется.
@@ -50,14 +51,20 @@ cmd = [
 timeout_sec = 3600
 
 [memory]
-# snapshot — читаем замороженный на C0 срез из файла (дёшево, не жжёт квоту xmemory)
-# xmemcli  — ходим в память по-настоящему (для демо и этапа 2)
-mode = "snapshot"
+# Primary demo/evolve path: xmemory. Reproducible bulk fallback: file.
+# File is not a naive Markdown dump: it preserves lifecycle, Task relations,
+# versioning, isolation and write->read durability, but is explicitly reported as fallback=true.
+backend = "file"                       # file | xmemory
 snapshot = "dataset/facts/snapshot-c0.md"
-xmem_instance = "5f1dea7e-4daa-45f7-b667-758f4b33b960"
+retrieval = "task-slices"
+top_k = 20
+xmemcli = "xmemcli"
 
-# Шаг актуализации памяти (Stop-хук). На этапе 1 держим выключенным:
-# он добавляет memory-on лишний ход и лишние токены, то есть портит ровно ту
-# метрику, ради которой всё затевалось. Включать вместе с mode = "xmemcli",
-# когда памяти есть куда писать, и считать его токены отдельно.
-write_back = false
+# Required in both memory-on streams. Coding usage and memory read/write usage are logged separately.
+write_back = true
+
+# For backend="xmemory", provision a UNIQUE instance from the same C0 for every
+# memory mode/seed and paste the returned ids here. The runner rejects missing ids.
+[memory.xmemory_instances]
+# "memory-on.seed1" = "..."
+# "memory-on+evolve.seed1" = "..."

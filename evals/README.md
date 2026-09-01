@@ -1,79 +1,77 @@
-# Эвалы: фича из будущего, с памятью и без
+# Eval protocol: хронологическая память на фичах из будущего
 
-Идея: не выдумывать синтетические задачи, а **реплеить историю целевого репозитория**. Откатываемся
-на N коммитов назад, берём реальную фичу, которая была сделана после этой точки (эталон уже
-существует!), и просим агента реализовать её дважды — с памятью и без. Единственная разница между
-прогонами — блок фактов в контексте.
+Мы реплеим реальные Mealie PR после C0. Формулировка приходит из issue/описания, код каждой задачи
+стоит на родителе эталонного PR, а solution commit и hidden tests недоступны coding-agent. Память
+изначально содержит только факты C0.
 
-Также как идея рассматривалась возможность придумать синтетические задачи и взять их для тестов.
+Архивный Sonnet 5 seed1 сохранён как **naive full-snapshot negative control**: один полный
+read-only dump во все задачи. Он проверял ранний контур, но не real write→read и не task-relevant
+retrieval. Новый primary protocol не пересчитывает и не переписывает этот baseline.
 
-## Протокол одного эксперимента
+## Три экспериментальных stream
 
-1. **Реперная точка.** Выбираем коммит `C0`. *(Уточнение по итогам сборки датасета: память строится на `C0`, а код каждой задачи чекаутится на её собственный базовый коммит — родителя эталонного PR. Иначе PR не ложится на дерево и его тесты не соответствуют коду. Подробно — [`../dataset/repo.md`](../dataset/repo.md#реперная-точка-c0-и-раскладка-прогонов).)* Память строится скиллом по состоянию `C0`
-   (или по истории до `C0`) и замораживается снапшотом.
-2. **Задача.** Реальный PR/фича, смерженная после `C0`. Формулировку задачи берём из issue/описания
-   PR, а не из диффа — агент не должен видеть эталон.
-3. **Два изолированных прогона из одного снапшота** (однокоммитный workspace на базе задачи):
-   - `memory-off`: агент + задача;
-   - `memory-on`: тот же агент + задача + релевантные active-факты (раннер логирует, какие именно
-     факты уехали в контекст).
-   Фиксируем модель, промпт, инструменты, лимиты. Порядок прогонов чередуем между экспериментами,
-   ключевые задачи повторяем ×3 — один запуск недетерминированной модели ничего не доказывает.
-4. **Метрики.**
+- `memory-off`: новая coding-session на каждую задачу, памяти нет;
+- `memory-on`: `a1→a2→a3→a4→a5→a6`, перед каждой задачей scoped active read, после — validated
+  mutation batch и Task links; запись видна новой сессии следующей задачи;
+- `memory-on+evolve`: отдельный clone того же C0 и тот же поток, но между a3/a4 curator-session.
 
-| Ось | Метрика | Как считаем |
-| --- | --- | --- |
-| Цена | токены, wall-clock, число итераций/правок | из логов прогона |
-| Механика | компиляция, штатные тесты репозитория | автоматически |
-| Архитектура | скрытые архитектурные проверки | чеклист по эталону, см. ниже |
+Code workspaces независимы и всегда создаются на `task.base_commit`; agent diffs не перетекают.
+Memory state намеренно перетекает только внутри одного mode/seed. У каждой пары mode/seed свой
+file state или xmemory instance. Это исключает загрязнение между режимами/repeats.
 
-## Скрытые архитектурные проверки
+Curator не видит репозиторий, a4–a6, solution commits или hidden tests. Он ревьюит только уже
+накопленные candidates/gotchas/questions и xmemory schema suggestions, следует правилу «код
+прав», дедуплицирует, stale/supersede и может применить явно подтверждённую schema migration.
 
-Главная хитрость. Для каждой задачи заранее (по эталонному PR и известным граблям) пишем чеклист
-проверок, который агент **не видит**, но на который без памяти можно напороться:
+## Scoring и валидность
 
-```yaml
-task: "Добавить отмену заказа"
-checks:
-  - id: notify-consumers
-    assert: "публикуется order.cancelled (консюмеры Billing и Notifications должны узнать)"
-    kind: llm-judge          # судья смотрит дифф, отвечает да/нет с цитатой
-  - id: no-direct-table
-    assert: "нет прямых запросов к billing_table из модуля orders"
-    kind: grep               # детерминированно: паттерн по диффу
-  - id: shipped-invariant
-    assert: "отмена запрещена для статуса shipped"
-    kind: hidden-test        # заранее написанный тест, запускается после прогона
-  - id: idempotent-handler
-    assert: "обработчик отмены идемпотентен"
-    kind: llm-judge
+Primary score — feature-dependent lift относительно обязательных null/oracle selftests:
+
+```text
+feature_lift = (agent_passed - null_passed) / (oracle_passed - null_passed)
 ```
 
-Три вида проверок по возрастанию силы: `grep` (детерминированный паттерн по диффу), `hidden-test`
-(тест, который агент не видит, прогоняется после), `llm-judge` (судья с эталонным PR в качестве
-reference — допустим, потому что эталон существует). Скор задачи = доля пройденных проверок.
+Неположительный oracle gap делает точку неeligible с boundary reason; отрицательный lift не
+зажимается. Micro hidden ratio и binary `task_success` остаются secondary diagnostics.
 
-Каждая проверка в идеале трассируется к факту памяти (`notify-consumers` ← факт
-`Orders produces order.*`). Тогда результат читается как attribution: **вот факт → вот его чтение
-в MemoryRead → вот пройденная проверка, которую без него завалили**. Это и есть демо-нарратив.
+`valid_run` означает техническую валидность: agent rc/usage/CLI, memory read+write и junit
+разобраны. `analytical_eligible` дополнительно требует зелёную regression и запрещает
+изменение/удаление существующих tests. Добавленные tests считаются отдельно и видны в diff.
 
-## Что показываем в финале
+Перед regression runner восстанавливает весь pristine `tests/` из base commit, затем накладывает
+hidden tests эталонного PR. Поэтому ослабление теста агентом не может повысить score. Красная
+regression и test interference остаются в CSV, но исключаются из primary comparison.
 
-1. Таблица по 6–10 задачам: memory-off vs memory-on — проверки, токены, время (с повторами).
-2. Два-три парных разбора «на пальцах»: конкретная задача, конкретный факт, конкретная ошибка,
-   которую память предотвратила.
-3. Learning curve (если успеем): память после 25% / 50% / 100% истории — как растёт скор.
+Summary считается macro по задачам внутри seed, затем показывает median/range по трём repeats.
+Один seed — наблюдение, не каузальный вывод.
 
-Зафиксированные прогоны и ограничения их интерпретации складываем в
-[`results/`](results/README.md). Первый baseline: [Sonnet 5 medium, seed 1,
-2026-09-01](results/2026-09-01-sonnet5-medium-seed1.md).
+## Retrieval, architecture и attribution
 
-## Ловушки, о которых уже знаем
+Заранее объявленные `task.slices` и `expected_facts` не попадают в prompt. File fallback
+детерминированно фильтрует sections по slices и text score; xmemory получает scoped/top-k query.
+Логируются exact injected ID/content, chars/tokens, precision/coverage и irrelevant facts.
 
-- **Память и судья должны быть независимы.** Судья не читает память — только дифф, эталон и чеклист.
-- **Не менять исполнителя и линейку одновременно.** Промпт/модель/инструменты между off/on идентичны
-  до байта, кроме блока фактов.
-- **Формулировка задачи не должна протекать.** Если в issue написано «не забудьте событие для
-  Billing» — проверка notify-consumers не считается (подсказка была в задаче, не в памяти).
-- **Дешёвые задачи — тоже данные.** Если на простых задачах дельты нет, честно показываем: память
-  окупается на задачах, трогающих ≥ 2 модулей. Это вывод, а не провал.
+Для class A в `tasks.yaml` заранее объявлены deterministic `required_path_groups` и forbidden
+shortcuts: migration, expected layer, repository/controller convention, tenant scope. Они не
+содержат solution text и не доступны agent. Class B допускает отдельного blinded judge, которому
+показывают только обезличенный diff и reference после coding run. Tests/solution leakage в memory
+запрещены.
+
+`attribution.json` связывает fact/lesson → exact read → Task.used/produced links → diff paths →
+hidden/architecture outcome. Harmful indicators выводятся из парных результатов: on ниже off,
+stale fact в used_facts или regression после retrieval. Где CLI не даёт tool trace,
+`files_read/time_to_first_relevant_file` остаются `null`, а не оцениваются на глаз.
+
+## Transfer clusters и план запуска
+
+Две аналитические дорожки:
+
+- config/API/auth: `a2→a4→a5`;
+- data/repository/invariants: `a1→a3→a6`.
+
+Сначала бесплатные fake/null/oracle gates. Затем один платный canary `a3→evolve→a6` во всех трёх
+режимах. Только после зелёной regression, write→read и durability trace запускается full matrix с
+тремя repeats. Точные команды — в [`dataset/runner/README.md`](../dataset/runner/README.md).
+
+Зафиксированные результаты складываются в [`results/`](results/README.md). Исходная архивная
+точка: [Sonnet 5 medium, seed 1, 2026-09-01](results/2026-09-01-sonnet5-medium-seed1.md).

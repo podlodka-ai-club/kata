@@ -1,130 +1,173 @@
 # Раннер прогонов
 
-Одна задача — одна сессия агента, один режим памяти, один повтор. Разница между `memory-off` и `memory-on` — **только наличие хуков**; промпт, модель, инструменты и лимиты идентичны.
+Раннер поддерживает три режима:
 
-```
-dataset/
-  runner/run.py             один прогон
-  runner/sweep.py           матрица задач × режимов × повторов + сводная таблица
-  runner/config.example.toml
-  hooks/session_start.sh    чтение памяти (stdout уезжает в контекст)
-  hooks/stop.py             шаг актуализации памяти, с гардом от петли
-  hooks/settings.memory-on.json
-```
+- `memory-off` — coding-agent без памяти;
+- `memory-on` — хронологический поток `read → coding task → validated write`;
+- `memory-on+evolve` — тот же поток, но после `a3` и до `a4` запускается отдельная curator-session.
 
-## Установка
+Каждая coding task остаётся новой Claude-сессией и одноразовым workspace. Долговечное состояние
+живет отдельно, в уникальном stream `mode/seed`, клонированном из frozen C0. Поэтому код задач не
+накапливается, а опыт в памяти — накапливается. Потоки `memory-on` и `memory-on+evolve` одного seed
+стартуют из побайтово одинакового C0, но никогда не используют общий state/instance.
 
-```bash
-apt-get install -y libldap2-dev libsasl2-dev    # иначе не соберётся python-ldap у mealie
-pip install pyyaml                              # python >= 3.11 (нужен tomllib)
-cp dataset/runner/config.example.toml dataset/runner/config.toml   # правим под себя
-```
+## Что реализовано
 
-Провайдер и лимиты живут в `config.toml`, а не в коде — каждый жжёт свои токены.
-Для `agent.model` обязателен полный pinned Claude API model id; короткие алиасы раннер
-отвергает. Начиная с поколения 4.6 dateless ids тоже являются закреплёнными snapshots.
-Первый canary зафиксирован на `claude-sonnet-5` с `effort = "medium"`; оба значения
-пишутся в метрики и одинаковы для `memory-off`/`memory-on`.
+`memory_backend.py` задаёт один backend-контракт. Primary для demo/evolve — xmemory. Файловый
+backend — воспроизводимый bulk/selftest fallback: он сохраняет те же lifecycle/provenance semantics,
+Task-relations, journal и версии, но в метриках явно имеет `fallback=true`.
 
-## Сначала самопроверка каркаса
+Перед задачей backend выбирает только `active` facts из `task.slices` (и ранжирует их по тексту
+задачи до `top_k`). SessionStart инжектит подготовленный ответ, а runner сохраняет точный текст,
+fact IDs, chars/estimated tokens, precision/coverage и irrelevant IDs. Полный C0 не передаётся.
 
-**Обязательный ритуал перед любым настоящим прогоном и перед добавлением новой задачи.**
+Stop-hook возвращает coding-agent на U3 один раз. Агент пишет
+`.kata-run/memory_mutations.json`; runner валидирует `create/update/stale/noop`, evidence,
+`Task.used_facts/produced_facts`, применяет batch backend’ом и только затем повышает state version.
+Следующая новая сессия заново открывает state и читает уже записанные изменения — это durability
+boundary, а не перенос контекста Claude.
 
-```bash
-python dataset/runner/sweep.py --selftest        # все задачи
-```
+Evolution checkpoint не имеет checkout Mealie, будущих задач, solution commits или hidden tests.
+Curator видит только накопленный audit shadow, candidates/gotchas/questions и xmemory schema
+suggestions. Он может дедуплицировать, разрешать противоречия по evidence («код прав»), stale/update
+существующие facts и принять/отложить schema suggestions. Создавать solution facts ему запрещено.
 
-Два псевдоагента проверяют не модель, а измерительный прибор:
+## Бесплатные проверки
 
-- `null` не делает ничего → скрытые тесты **обязаны** упасть;
-- `oracle` кладёт исходники эталонного PR (без тестов) → **обязаны** пройти.
-
-Если хоть одно не так, задача не измеряет ничего, и никакая модель этого не исправит. Прогнано на всех шести задачах:
-
-| Задача | null | oracle | сколько проверок реально меряет |
-| --- | --- | --- | --- |
-| a1 нормализация | 15/21 | 21/21 | 6 |
-| a2 XSS и iframe | 41/44 | 44/44 | 3 |
-| a3 IntegrityError → 409 | 23/27 | 27/27 | 4 |
-| a4 нативный OIDC | 0/5 | 5/5 | 5 |
-| a5 отключённые способы входа | 4/5 | 5/5 | **1** |
-| a6 recipeCount и слияние | 0/9 | 9/9 | 9 |
-
-Регрессия везде зелёная — значит красное на скрытых тестах даёт именно отсутствие фичи, а не сломанное окружение.
-
-Последняя колонка — разрыв между null и oracle, то есть сколько проверок вообще зависит от задачи. У `a5` она одна: задача останется в сете, но делать на ней выводы нельзя, шум перекроет. Самые острые — `a4` и `a6`, там без фичи не проходит ничего.
-
-## Прогон
+Нужны Python 3.11+ и PyYAML. В проекте удобно запускать через `uv`:
 
 ```bash
-python dataset/runner/run.py --task a3 --mode memory-off --seed 1     # один прогон
-python dataset/runner/sweep.py --seeds 3                              # весь этап 1
-python dataset/runner/sweep.py --tasks a3 --seeds 1 --skip-setup      # без явного uv sync
+uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py --memory-selftest
 ```
 
-`--skip-setup` пропускает явный `uv sync`; окружение всё равно соберёт `uv run` при первом запуске тестов. Workspace у каждого прогона свой и удаляется после — совместимый флаг `--keep-worktree` оставляет его для разбора.
+Этот fake/file selftest не вызывает Claude или xmemory и проверяет isolation mode/seed,
+chronological write→read, повторное открытие state после «рестарта», task-relevant retrieval,
+evolution checkpoint, запрет будущих create из curator-session, Task provenance, typed xmemory
+relations, `feature_lift` boundaries и analytical eligibility.
 
-`sweep` чередует порядок режимов между сидами и задачами. При одноразовых workspace эффекта «второй прогон теплее» нет в принципе, так что это дополнительная страховка от дрейфа протокола.
+Затем обязательный null/oracle gate всех hidden suites (тоже без модели/xmemory):
 
-## Что происходит внутри
+```bash
+uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py \
+  --selftest --skip-setup --config dataset/runner/config.example.toml
+```
 
-1. `base_commit` задачи выгружается из reference clone через `git archive` в свежий локальный
-   репозиторий с **единственным** стартовым коммитом. У агента физически нет будущей истории,
-   эталонного решения и скрытых тестов. Память собрана на C0, а код стоит на базе задачи.
-2. Из дерева удаляются чужие агентские файлы (`AGENTS.md`, `CLAUDE.md`). Без этого `memory-off` — это «с чужой памятью».
-3. В обоих режимах ставится одинаковая строгая среда: `dontAsk`, явный `--tools`, project-only
-   settings, пустой MCP и OS sandbox без чтения домашнего каталога, сети и unsandboxed retry.
-   Сам workspace живёт во временном каталоге, а нужный `uv` копируется внутрь него.
-4. В `memory-on` к тем же settings добавляется SessionStart-хук. Хуки и файловый снапшот
-   копируются внутрь workspace; в `memory-off` нет ни пути к памяти, ни xmemory id.
-5. Запускается агент.
-6. Снимается дифф, гоняется регрессия **на дереве агента, до наложения скрытых тестов**.
-7. Скрытые тесты накладываются из эталонного коммита и гоняются.
+`null` обязан оставить feature-dependent checks красными; `oracle` накладывает только исходники
+эталонного PR (без tests) и обязан пройти. Regression в обеих сторонах должна быть зелёной.
 
-Про пункт 7 стоит сказать отдельно: **скрытые тесты не «прячутся»** — на базовом коммите их в новой редакции просто ещё нет. Мы накладываем их поверх дерева агента после прогона. Если агент правил тест-файлы сам, это видно по флагу `agent_touched_tests` — такой прогон надо смотреть глазами, а не засчитывать.
+## Конфигурация backend
 
-## Артефакты прогона
+```bash
+cp dataset/runner/config.example.toml dataset/runner/config.toml
+```
 
-`runs/<task>/<mode>/seed<N>/`:
+Для бесплатного/reproducible bulk режима оставьте:
 
-| Файл | Что |
-| --- | --- |
-| `metrics.json` | всё измеренное: score, hidden, regression, diff, usage, время |
-| `hidden.xml`, `regression.xml` | junit — поимённо, какие проверки упали |
-| `diff.patch` | что агент сделал |
-| `context_injected.txt` | **что именно уехало в контекст** — без этого attribution «факт → пройденная проверка» не собрать |
-| `hook_session_start.fired` | след того, что хук стрелял: отличает «память пустая» от «хук не отработал» |
-| `prompt.txt`, `agent_stdout.log`, `setup.log` | сырьё для разбора |
+```toml
+[memory]
+backend = "file"
+snapshot = "dataset/facts/snapshot-c0.md"
+retrieval = "task-slices"
+top_k = 20
+write_back = true
+```
 
-`sweep` сводит всё в `runs/results.csv`.
+Это полноценный read/write lifecycle, но не xmemory; отчёты маркируют его fallback.
 
-## Что раннер не даст соврать
+Для настоящего xmemory demo сначала авторизуйтесь вне репозитория, затем создайте отдельные
+инстансы. Команды ниже делают control-plane create и один structured C0 seed; они требуют
+xmemory quota, но не Claude:
 
-- **Пустой `memory-on` не засчитывается.** Если в контекст ничего не уехало (снапшот пуст, хук не отработал), прогон помечается `memory_ok: false`, а `sweep` выкидывает его из сводки. Иначе 36 прогонов честно отработают и покажут сравнение пустоты с пустотой.
-- **Невалидный прогон не превращается в ноль.** Ненулевой rc агента, неразобранный usage,
-  неприехавшая память или отсутствующий junit оставляют строку в CSV для расследования, но исключают её из сравнения;
-  неполная матрица завершает `sweep` с ошибкой.
-- **Модель, effort и CLI записываются.** В `metrics.json` и CSV остаются полный model id,
-  effort, версия CLI и cache-creation/read токены.
-- **Скор — доля пройденных проверок**, а не «зелёно/красно». «Сделал 4 из 5» и «не сделал ничего» — разные вещи, и именно из этой разницы собирается разбор «память предотвратила конкретную ошибку».
-- **Всё скипнулось — не зелёный.** `green` требует `passed > 0`, иначе отсутствие LDAP-сервиса превращается в победу.
-- **Скрытые тесты исключены из регрессии.** В старой редакции они могут честно упасть на правильной реализации, и это не «сломал чужое».
-- **Служебные файлы вне диффа.** `.claude/`, `.kata-*`, `.uv-cache` и удалённые
-  `AGENTS.md` / `CLAUDE.md` не попадают ни в `files_changed`, ни в `diff.patch` — иначе
-  `memory-on` систематически «на файл больше», а `llm-judge` узнаёт из него режим.
-- **Stop-хук выключен, пока памяти некуда писать** (`memory.write_back = false`). Он добавляет `memory-on` лишний ход и лишние токены, то есть портит ровно ту метрику, ради которой всё затевалось.
+```bash
+xmemcli auth status
+python dataset/runner/provision_xmemory.py provision \
+  --name kata-memory-on-seed1 --snapshot dataset/facts/snapshot-c0.md
+python dataset/runner/provision_xmemory.py provision \
+  --name kata-memory-on-evolve-seed1 --snapshot dataset/facts/snapshot-c0.md
+```
 
-## Грабли, на которые уже наступили
+Скопируйте два `instance_id` в `config.toml`:
 
-**`UV_FROZEN=1` обязателен для всех команд**, не только для `uv sync`. У mealie в `pyproject.toml` скользящее окно `exclude-newer = "5 days"`; без переменной uv на каждый вызов переразрешает лок и падает на пинах внутри окна. Живёт в `[repo].env`.
+```toml
+[memory]
+backend = "xmemory"
 
-**Результат читается из junit-xml, а не из хвоста вывода.** Парсинг строки «N passed» ломается: uv дописывает свои предупреждения после вывода pytest, и в первой версии раннера прогон с четырьмя честно упавшими тестами отчитался как `passed=0 failed=0`. XML заодно даёт поимённый список упавших проверок.
+[memory.xmemory_instances]
+"memory-on.seed1" = "<instance-id-1>"
+"memory-on+evolve.seed1" = "<instance-id-2>"
+```
 
-**`AGENTS.md` в mealie появился не сразу** — на ранних базовых коммитах его нет, и это нормально. Строка `убрано: —` в логе не означает ошибку.
+Для full sweep с тремя repeats нужно шесть инстансов: по одному для каждой пары
+`(memory-on|memory-on+evolve, seed1|seed2|seed3)`. Runner отвергает пустой неявный id;
+не переиспользуйте инстанс между ключами. Удаление инстансов скрипт намеренно не автоматизирует.
 
-**Часть тестов логина скипается без LDAP-сервиса.** Скипы считаются отдельно от провалов, `green` по ним не падает.
+## Один run, canary, full matrix
 
-## Чего ещё нет
+Один `memory-on` run (coding-agent и backend расходы возможны):
 
-- Адаптер `codex` — контракт тот же, надо только дописать разбор его usage-вывода в `run_agent`.
-- Attribution «факт → проверка»: `context_injected.txt` и `hidden.xml` уже есть, связать их — дело сводной таблицы.
+```bash
+uv run --python 3.12 --with pyyaml python dataset/runner/run.py \
+  --config dataset/runner/config.toml \
+  --task a3 --mode memory-on --seed 1 \
+  --memory-state runs/manual/_memory/memory-on/seed1 \
+  --reset-memory --skip-setup --out runs/manual
+```
+
+Research canary: `a3 → a6`, один seed, три режима. Для evolving stream checkpoint запускается
+сразу после a3, затем новая coding-session a6 читает post-evolution state:
+
+```bash
+uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py \
+  --config dataset/runner/config.toml \
+  --tasks a3 a6 \
+  --modes memory-off memory-on memory-on+evolve \
+  --seeds 1 --skip-setup \
+  --out runs/canary-a3-a6
+```
+
+Только после зелёного canary — полная матрица с тремя repeats:
+
+```bash
+uv run --python 3.12 --with pyyaml python dataset/runner/sweep.py \
+  --config dataset/runner/config.toml \
+  --modes memory-off memory-on memory-on+evolve \
+  --seeds 3 --skip-setup \
+  --out runs/full-read-write-evolve-r3
+```
+
+Обе команды запускают платные Claude-сессии; xmemory backend дополнительно расходует read/write и
+schema-suggestion quota. Runner не запускает их из selftest и не запускает автоматически.
+
+## Pristine grading и eligibility
+
+Runner снимает agent diff, классифицирует tests как `added`, `modified_existing` или
+`deleted_existing`, затем полностью восстанавливает pristine tests базового коммита. Только после
+этого запускаются regression и overlay hidden tests. Поэтому ослабление штатных tests не может
+улучшить score. Добавленные tests видны в diff, но не становятся grading suite.
+
+`valid_run` — техническая валидность: rc/usage/CLI, memory read+write и оба junit разобраны.
+`analytical_eligible` строже: дополнительно требует зелёную regression и отсутствие
+изменения/удаления существующих tests. Неeligible строки остаются в CSV для расследования, но не
+входят в primary macro comparison.
+
+Primary task score:
+
+```text
+feature_lift = (agent_passed - null_passed) / (oracle_passed - null_passed)
+```
+
+Нулевой/отрицательный oracle gap даёт `null` + boundary reason, а не деление на ноль. Отрицательный
+lift не зажимается: это сигнал вреда/регрессии. `task_success` остаётся дополнительным бинарным
+полем. CSV показывает macro-average по задачам, затем median/range по repeats; micro hidden count
+сохраняется только как диагностическая метрика.
+
+## Артефакты
+
+Для каждой task: `metrics.json`, pristine `regression.xml`, `hidden.xml`, `diff.patch`,
+`memory_read.json`, `memory_write.json`, exact `context_injected.txt`, mutation batch и
+`attribution.json`. Состояние stream лежит в `_memory/<mode>/seedN/state.json`; evolution — в
+`_evolution/memory-on+evolve/seedN/evolution.json`. Общий `results.csv` содержит coding/read/write/
+evolve cost отдельно, retrieval, lifecycle mutations, architecture placement и eligibility.
+
+`files_read` и `time_to_first_relevant_file` записываются как unavailable, если выбранный CLI не
+даёт tool trace. Runner не подменяет отсутствие trace выдуманным числом.

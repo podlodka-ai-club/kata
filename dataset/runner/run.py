@@ -9,8 +9,8 @@
   2. материализует base_commit в свежий однокоммитный git repo без будущей истории;
   3. убирает чужие агентские файлы (AGENTS.md / CLAUDE.md) — в ОБОИХ режимах,
      иначе в memory-off приезжает чужая память, а в memory-on — две сразу;
-  4. в memory-on кладёт .claude/settings.json с хуками и проверяет, что память
-     реально уехала в контекст (пустой снапшот = прогон невалиден, не тихий ноль);
+  4. в memory modes читает scoped active facts из изолированного durable backend,
+     инжектит exact context и применяет validated write-back после новой сессии;
   5. запускает агента;
   6. снимает дифф, гоняет регрессию (скрытые тесты из неё исключены);
   7. накладывает скрытые тесты из эталонного коммита и гоняет их;
@@ -36,6 +36,8 @@ import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from memory_backend import MemoryError as BackendMemoryError, open_backend
 
 try:
     import yaml
@@ -143,6 +145,10 @@ class Task:
     hidden_tests: list[str]
     slices: list[str] = field(default_factory=list)
     contract: str | None = None
+    expected_facts: list[str] = field(default_factory=list)
+    grading: dict = field(default_factory=dict)
+    architecture: dict = field(default_factory=dict)
+    transfer_cluster: str | None = None
 
 
 def load_tasks(path: Path) -> tuple[dict, dict[str, Task]]:
@@ -157,6 +163,10 @@ def load_tasks(path: Path) -> tuple[dict, dict[str, Task]]:
             hidden_tests=t["hidden_tests"],
             slices=t.get("slices", []),
             contract=(" ".join(t["contract"].split()) if t.get("contract") else None),
+            expected_facts=t.get("expected_facts", []),
+            grading=t.get("grading", {}) or {},
+            architecture=t.get("architecture", {}) or {},
+            transfer_cluster=t.get("transfer_cluster"),
         )
         for t in doc.get("tasks", [])
     }
@@ -193,7 +203,7 @@ def ensure_clone(cfg) -> Path:
         clone.parent.mkdir(parents=True, exist_ok=True)
         print(f"[workspace] клонирую {cfg['repo']['url']} -> {clone}")
         sh(["git", "clone", cfg["repo"]["url"], str(clone)], check=True)
-    else:
+    elif cfg["repo"].get("fetch", True):
         sh(["git", "fetch", "--quiet", "--all"], cwd=clone, check=True)
     return clone
 
@@ -250,8 +260,8 @@ def strip_foreign_memory(wt: Path, names: list[str]) -> list[str]:
 
 def install_agent_settings(wt: Path, memory_on: bool, write_back: bool) -> None:
     """
-    В обоих режимах ставит одинаковую OS-песочницу. В memory-on дополнительно
-    ставит SessionStart, который читает локальную копию снапшота.
+    Во всех режимах ставит одинаковую OS-песочницу. В memory modes дополнительно
+    ставит SessionStart для prepared task context и Stop для write-back.
 
     Stop-хук (шаг актуализации памяти) ставим ТОЛЬКО когда памяти реально есть
     куда писать. Иначе он гарантированно добавляет memory-on лишний ход и лишние
@@ -276,7 +286,8 @@ def install_agent_settings(wt: Path, memory_on: bool, write_back: bool) -> None:
         json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def install_agent_runtime(wt: Path, cfg, memory_on: bool) -> dict[str, str]:
+def install_agent_runtime(wt: Path, cfg, memory_on: bool,
+                          prepared_context: str | None = None) -> dict[str, str]:
     """Копирует минимальный runtime внутрь sandbox и возвращает его env."""
     bin_dir = wt / ".kata-bin"
     bin_dir.mkdir(exist_ok=True)
@@ -295,13 +306,17 @@ def install_agent_runtime(wt: Path, cfg, memory_on: bool) -> dict[str, str]:
         shutil.copytree(HOOKS_DIR, local_hooks)
         env["KATA_HOOKS_DIR"] = str(local_hooks)
         env["KATA_RUN_DIR"] = str(wt / ".kata-run")
-        env["KATA_MEMORY_MODE"] = cfg["memory"]["mode"]
-        if cfg["memory"]["mode"] == "snapshot":
+        env["KATA_MEMORY_MODE"] = "prepared"
+        if prepared_context is not None:
+            local_context = local_hooks / "task-context.json"
+            local_context.write_text(prepared_context, encoding="utf-8")
+            env["KATA_FACTS_CONTEXT"] = str(local_context)
+        elif cfg["memory"].get("retrieval") == "naive-dump":
+            env["KATA_MEMORY_MODE"] = "snapshot-naive"
             snapshot = (ROOT / cfg["memory"]["snapshot"]).resolve()
             local_snapshot = local_hooks / "snapshot-c0.md"
             shutil.copy2(snapshot, local_snapshot)
             env["KATA_FACTS_SNAPSHOT"] = str(local_snapshot)
-        env["KATA_XMEM_INSTANCE"] = cfg["memory"].get("xmem_instance", "")
     return env
 
 
@@ -435,13 +450,97 @@ def capture_diff(wt: Path, run_dir: Path, exclude: list[str] | None = None) -> d
     _, stat, _ = sh(["git", "diff", "--cached", "--numstat"], cwd=wt)
     rows = [l.split("\t") for l in stat.splitlines() if l.strip()]
     touched = [r[2] for r in rows if len(r) == 3]
+    _, status, _ = sh(["git", "diff", "--cached", "--name-status"], cwd=wt)
+    test_changes = {"added": [], "modified_existing": [], "deleted_existing": []}
+    for line in status.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or not parts[-1].startswith("tests/"):
+            continue
+        code, path = parts[0][0], parts[-1]
+        if code == "A":
+            test_changes["added"].append(path)
+        elif code == "D":
+            test_changes["deleted_existing"].append(path)
+        else:
+            test_changes["modified_existing"].append(path)
     return {
         "files_changed": len(touched),
         "touched": touched[:60],
         "agent_touched_tests": any(p.startswith("tests/") for p in touched),
+        "test_changes": test_changes,
+        "agent_changed_existing_tests": bool(test_changes["modified_existing"]
+                                             or test_changes["deleted_existing"]),
         "insertions": sum(int(r[0]) for r in rows if r[0].isdigit()),
         "deletions": sum(int(r[1]) for r in rows if r[1].isdigit()),
     }
+
+
+def snapshot_pristine_tests(wt: Path) -> Path:
+    """Keep base tests outside the agent workspace, then restore them for grading."""
+    root = Path(tempfile.mkdtemp(prefix="kata-pristine-tests-"))
+    source = wt / "tests"
+    if source.exists():
+        shutil.copytree(source, root / "tests")
+    return root
+
+
+def restore_pristine_tests(wt: Path, pristine: Path) -> None:
+    target = wt / "tests"
+    if target.exists():
+        shutil.rmtree(target)
+    source = pristine / "tests"
+    if source.exists():
+        shutil.copytree(source, target)
+
+
+def feature_lift(agent_passed: int, null_passed: int | None,
+                 oracle_passed: int | None) -> tuple[float | None, str | None]:
+    """Normalized feature lift; negative harm and >1 over-oracle values stay observable."""
+    if null_passed is None or oracle_passed is None:
+        return None, "missing_null_or_oracle"
+    denominator = oracle_passed - null_passed
+    if denominator <= 0:
+        return None, "non_positive_oracle_gap"
+    return round((agent_passed - null_passed) / denominator, 6), None
+
+
+def architecture_grade(task: Task, touched: list[str], diff_text: str) -> dict:
+    """Deterministic, predeclared placement checks; prompts never expose these rules."""
+    groups = task.architecture.get("required_path_groups", [])
+    required = []
+    for group in groups:
+        matched = sorted({p for p in touched if any(re.search(pattern, p) for pattern in group)})
+        required.append({"patterns": group, "passed": bool(matched), "matched": matched})
+    forbidden = []
+    for rule in task.architecture.get("forbidden", []):
+        path_hits = sorted({p for p in touched if re.search(rule.get("path_regex", r"$^"), p)})
+        diff_hit = bool(rule.get("diff_regex") and re.search(rule["diff_regex"], diff_text, re.M))
+        forbidden.append({"name": rule.get("name", "forbidden shortcut"),
+                          "passed": not path_hits and not diff_hit,
+                          "path_hits": path_hits, "diff_hit": diff_hit})
+    checks = [r["passed"] for r in required] + [r["passed"] for r in forbidden]
+    return {"required": required, "forbidden": forbidden,
+            "passed": sum(checks), "total": len(checks),
+            "green": bool(checks) and all(checks),
+            "score": round(sum(checks) / len(checks), 3) if checks else None,
+            "judge": task.architecture.get("judge", "deterministic")}
+
+
+def analytical_eligibility(valid_run: bool, regression: dict, diff: dict,
+                           memory_required: bool, memory_read_ok: bool,
+                           memory_write_ok: bool) -> tuple[bool, list[str]]:
+    reasons = []
+    if not valid_run:
+        reasons.append("technical_invalid")
+    if not regression.get("green"):
+        reasons.append("regression_red")
+    if diff.get("agent_changed_existing_tests"):
+        reasons.append("existing_tests_modified_or_deleted")
+    if memory_required and not memory_read_ok:
+        reasons.append("memory_read_invalid")
+    if memory_required and not memory_write_ok:
+        reasons.append("memory_write_invalid")
+    return not reasons, reasons
 
 
 def run_tests(wt: Path, cfg, targets: list[str], run_dir: Path, label: str,
@@ -469,13 +568,17 @@ def main() -> int:
     ap.add_argument("--config", default="dataset/runner/config.toml")
     ap.add_argument("--tasks", default="dataset/tasks.yaml")
     ap.add_argument("--task", required=True)
-    ap.add_argument("--mode", choices=["memory-off", "memory-on"], required=True)
+    ap.add_argument("--mode", choices=["memory-off", "memory-on", "memory-on+evolve"], required=True)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--agent", default=None, help="claude | codex | null | oracle")
     ap.add_argument("--out", default="runs")
     ap.add_argument("--skip-setup", action="store_true")
     ap.add_argument("--keep-worktree", action="store_true",
                     help="не удалять рабочее дерево после прогона (для разбора)")
+    ap.add_argument("--memory-state", default=None,
+                    help="durable state directory for this chronological mode/seed stream")
+    ap.add_argument("--reset-memory", action="store_true",
+                    help="re-clone this stream from frozen C0 before the task")
     args = ap.parse_args()
 
     cfg = tomllib.loads((ROOT / args.config).read_text(encoding="utf-8"))
@@ -484,7 +587,8 @@ def main() -> int:
         sys.exit(f"нет задачи {args.task}; есть: {', '.join(tasks)}")
     task = tasks[args.task]
     kind = args.agent or cfg["agent"]["kind"]
-    write_back = bool(cfg.get("memory", {}).get("write_back", False))
+    memory_on = args.mode != "memory-off"
+    write_back = memory_on and bool(cfg.get("memory", {}).get("write_back", True))
 
     run_dir = ROOT / args.out / task.id / args.mode / f"seed{args.seed}"
     if run_dir.exists():
@@ -500,6 +604,34 @@ def main() -> int:
         print("[валидация] задача не готова к прогону, токены не тратим", file=sys.stderr)
         return 3
 
+    memory_backend = None
+    memory_read = None
+    memory_read_ok = not memory_on
+    memory_write = None
+    memory_batch = None
+    memory_write_ok = not memory_on
+    if memory_on:
+        snapshot = (ROOT / cfg["memory"]["snapshot"]).resolve()
+        state_dir = ((ROOT / args.memory_state).resolve() if args.memory_state else
+                     (ROOT / args.out / "_memory" / args.mode / f"seed{args.seed}").resolve())
+        try:
+            memory_backend = open_backend(cfg, state_dir, snapshot, args.mode, args.seed)
+            memory_backend.prepare(reset=args.reset_memory)
+            memory_read = memory_backend.read(task.id, task.slices,
+                                              f"{task.title}\n{task.prompt}",
+                                              int(cfg["memory"].get("top_k", 20)))
+            memory_read_ok = bool(memory_read.facts and memory_read.exact_text.strip())
+            (run_dir / "memory_read.json").write_text(
+                json.dumps(memory_read.metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+        except BackendMemoryError as exc:
+            print(f"[память] read/prepare failed: {exc}", file=sys.stderr)
+            print("[память] preflight failed; coding tokens are not spent", file=sys.stderr)
+            return 3
+        if not memory_read_ok:
+            print("[память] scoped retrieval returned no auditable active facts; "
+                  "coding tokens are not spent", file=sys.stderr)
+            return 3
+
     workspace_root = Path(tempfile.gettempdir()) / "kata-eval-workspaces"
     wt, removed = make_workspace(
         clone,
@@ -507,10 +639,11 @@ def main() -> int:
         workspace_root / f"{task.id}-{args.mode}-{args.seed}",
         cfg["repo"].get("strip_files", []),
     )
+    pristine = snapshot_pristine_tests(wt)
     try:
         print(f"[workspace] {task.id} @ {task.base_commit}, убрано: {removed or '—'}")
 
-        install_agent_settings(wt, args.mode == "memory-on", write_back)
+        install_agent_settings(wt, memory_on, write_back)
 
         if not args.skip_setup:
             rc, out, err = sh(cfg["repo"]["setup_cmd"], cwd=wt,
@@ -522,15 +655,16 @@ def main() -> int:
 
         # Runtime копируется в workspace: subprocess sandbox не получает доступ
         # к reference clone, датасету и снапшоту на хосте.
-        env_extra = install_agent_runtime(wt, cfg, args.mode == "memory-on")
-        if args.mode == "memory-on":
+        env_extra = install_agent_runtime(
+            wt, cfg, memory_on, memory_read.exact_text if memory_read else None)
+        if memory_on:
             env_extra.update({
                 "KATA_TASK_ID": task.id,
                 "KATA_SEED": str(args.seed),
             })
 
         print(f"[agent] {kind}, режим {args.mode}, сид {args.seed}"
-              + (", запись памяти включена" if args.mode == "memory-on" and write_back else ""))
+              + (", запись памяти включена" if memory_on and write_back else ""))
         agent = run_agent(kind, cfg, wt, task, clone, run_dir, env_extra)
         collect_hook_artifacts(wt, run_dir)
         if agent["rc"] not in (0, None):
@@ -541,8 +675,8 @@ def main() -> int:
         ctx_chars = len(ctx.read_text(encoding="utf-8")) if ctx.exists() else 0
         # Молчаливый memory-on, в который ничего не приехало, — это memory-off
         # под другим именем. Такой прогон не считается.
-        memory_ok = not (args.mode == "memory-on" and kind not in ("null", "oracle")
-                         and ctx_chars == 0)
+        memory_ok = not (memory_on and kind not in ("null", "oracle")
+                         and (ctx_chars == 0 or not memory_read_ok))
         if not memory_ok:
             print("[память] в контекст ничего не уехало: снапшот пуст или хук не отработал.\n"
                   "         Прогон помечен невалидным — сравнивать его с memory-off нельзя.",
@@ -550,6 +684,28 @@ def main() -> int:
 
         diff = capture_diff(wt, run_dir, exclude=removed)
         print(f"[diff] файлов {diff['files_changed']}, +{diff['insertions']}/-{diff['deletions']}")
+
+        mutation_file = run_dir / "memory_mutations.json"
+        if memory_on and write_back and kind not in ("null", "oracle"):
+            if not mutation_file.exists():
+                print("[память] агент не оставил memory_mutations.json", file=sys.stderr)
+            elif memory_backend and memory_read:
+                try:
+                    batch = json.loads(mutation_file.read_text(encoding="utf-8"))
+                    memory_batch = batch
+                    memory_write = memory_backend.apply(
+                        batch, memory_read.metrics.get("fact_ids", []), task.id)
+                    memory_write_ok = True
+                    (run_dir / "memory_write.json").write_text(
+                        json.dumps(memory_write, indent=2, ensure_ascii=False), encoding="utf-8")
+                except (BackendMemoryError, json.JSONDecodeError) as exc:
+                    print(f"[память] write-back rejected: {exc}", file=sys.stderr)
+        elif memory_on and not write_back:
+            print("[память] write_back=false: это только legacy naive-dump control", file=sys.stderr)
+
+        # Grading never consumes agent-edited tests. Added tests remain visible in the diff,
+        # while the executed suites are restored from the pristine base and then hidden overlay.
+        restore_pristine_tests(wt, pristine)
 
         # регрессия — на дереве агента, до наложения скрытых тестов.
         # Скрытые тесты исключены: в старой редакции они могут честно упасть
@@ -560,6 +716,30 @@ def main() -> int:
         overlay_hidden_tests(clone, wt, task)
         hidden = run_tests(wt, cfg, task.hidden_tests, run_dir, "hidden")
 
+        diff_text = (run_dir / "diff.patch").read_text(encoding="utf-8")
+        architecture = architecture_grade(task, diff["touched"], diff_text)
+        null_passed = task.grading.get("null_passed")
+        oracle_passed = task.grading.get("oracle_passed")
+        lift, lift_reason = feature_lift(hidden["passed"], null_passed, oracle_passed)
+        feature_passed = (hidden["passed"] - null_passed) if null_passed is not None else None
+        feature_total = ((oracle_passed - null_passed)
+                         if null_passed is not None and oracle_passed is not None else None)
+
+        injected_ids = memory_read.metrics.get("fact_ids", []) if memory_read else []
+        expected = task.expected_facts
+        relevant = sorted(set(injected_ids) & set(expected))
+        irrelevant = sorted(set(injected_ids) - set(expected))
+        retrieval = {
+            **(memory_read.metrics if memory_read else {
+                "backend": None, "fallback": False, "state_version": None,
+                "fact_ids": [], "facts_count": 0, "chars": 0, "estimated_tokens": 0,
+                "wall_sec": 0.0, "provider_usage": None}),
+            "expected_fact_ids": expected, "relevant_fact_ids": relevant,
+            "irrelevant_fact_ids": irrelevant, "irrelevant_count": len(irrelevant),
+            "precision": round(len(relevant) / len(injected_ids), 3) if injected_ids else None,
+            "coverage": round(len(relevant) / len(expected), 3) if expected else None,
+        }
+
         invalid_reasons = []
         if agent["rc"] != 0:
             invalid_reasons.append(f"agent_rc={agent['rc']}")
@@ -569,12 +749,34 @@ def main() -> int:
             invalid_reasons.append("agent_cli_version_missing")
         if not memory_ok:
             invalid_reasons.append("memory_not_injected")
+        if memory_on and write_back and kind not in ("null", "oracle") and not memory_write_ok:
+            invalid_reasons.append("memory_write_missing_or_rejected")
         if not regression["parsed"]:
             invalid_reasons.append("regression_junit_missing")
         if not hidden["parsed"]:
             invalid_reasons.append("hidden_junit_missing")
         valid_run = not invalid_reasons
         task_success = valid_run and regression["green"] and hidden["green"]
+        eligible, eligibility_reasons = analytical_eligibility(
+            valid_run, regression, diff, memory_on, memory_read_ok,
+            memory_write_ok if write_back else False)
+
+        decisions = {(d.get("fact_id")): d for d in ((memory_batch or {}).get("task") or {}).get("decisions", [])}
+        attribution = {
+            "task": task.id, "mode": args.mode, "seed": args.seed,
+            "links": [{
+                "fact_id": fact_id, "read": True,
+                "declared_expected": fact_id in expected,
+                "task_marked_used": bool(memory_write and fact_id in memory_write.get("used_facts", [])),
+                "code_decision": decisions.get(fact_id),
+                "diff_paths": diff["touched"],
+                "architecture_green": architecture["green"],
+                "hidden_passed": hidden["passed"], "hidden_total": hidden["tests"] - hidden["skipped"],
+            } for fact_id in injected_ids],
+            "produced_facts": (memory_write or {}).get("produced_facts", []),
+        }
+        (run_dir / "attribution.json").write_text(
+            json.dumps(attribution, indent=2, ensure_ascii=False), encoding="utf-8")
 
         metrics = {
             "task": task.id,
@@ -587,23 +789,46 @@ def main() -> int:
             "agent_effort": agent.get("effort", cfg["agent"].get("effort")),
             "agent_cli_version": agent.get("cli_version"),
             "agent_cmd": cfg["agent"].get("cmd") if kind not in ("null", "oracle") else None,
-            "memory_mode": cfg["memory"]["mode"],
+            "memory_mode": cfg["memory"].get("backend", "file"),
             "memory_write_back": write_back,
             "memory_ok": memory_ok,
             "base_commit": task.base_commit,
             "solution_commit": task.solution_commit,
             "c0": meta.get("c0"),
             "slices": task.slices,
+            "transfer_cluster": task.transfer_cluster,
             "wall_sec": round(agent["wall_sec"], 1),
             "usage": agent["usage"],
             "usage_parsed": agent["usage_parsed"],
             "valid_run": valid_run,
             "invalid_reasons": invalid_reasons,
+            "analytical_eligible": eligible,
+            "analytical_ineligible_reasons": eligibility_reasons,
             "task_success": task_success,
             "diff": diff,
             "regression": regression,
             "hidden": hidden,
-            "score": hidden["ratio"],          # доля пройденных проверок, не бинарь
+            "grading": {
+                "null_passed": null_passed, "oracle_passed": oracle_passed,
+                "feature_passed": feature_passed, "feature_total": feature_total,
+                "feature_lift": lift, "feature_lift_boundary": lift_reason,
+                "primary_score": lift,
+            },
+            "retrieval": retrieval,
+            "memory_read": memory_read.metrics if memory_read else None,
+            "memory_write": memory_write,
+            "architecture": architecture,
+            "process": {
+                "coding": {"wall_sec": round(agent["wall_sec"], 1), "usage": agent["usage"]},
+                "memory_read": memory_read.metrics if memory_read else None,
+                "memory_write": memory_write,
+                "evolve": None,
+                "files_read": None,
+                "time_to_first_relevant_file_sec": None,
+                "trace_available": False,
+            },
+            "score": lift,                    # primary: normalized feature-dependent lift
+            "hidden_micro_score": hidden["ratio"],  # secondary diagnostic
             "score_binary": 1.0 if hidden["green"] else 0.0,
             "context_injected_chars": ctx_chars,
         }
@@ -618,6 +843,7 @@ def main() -> int:
         print(f"[итог] артефакты в {run_dir}")
         return 0 if valid_run else 4
     finally:
+        shutil.rmtree(pristine, ignore_errors=True)
         if not args.keep_worktree:
             drop_workspace(wt)
 

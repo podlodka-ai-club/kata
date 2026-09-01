@@ -2,11 +2,9 @@
 # SessionStart: stdout этого хука уезжает в контекст сессии.
 # Это единственный канал, через который память попадает к агенту в режиме memory-on.
 #
-# Режим snapshot (по умолчанию): читаем замороженный на C0 срез фактов из файла.
-# Живые чтения из xmemory на каждый прогон съедают квоту — 36 прогонов этапа 1
-# это десятки вызовов, а квоты у нас впритык. Снапшот снимается один раз.
-#
-# Режим xmemcli: ходим в память по-настоящему. Нужен для демо и для этапа 2.
+# Primary runtime receives a task-scoped context prepared by the backend adapter.
+# The adapter logs the exact provider response and cost before this hook injects it.
+# `snapshot-naive` is retained only to reproduce the old full-dump negative control.
 set -uo pipefail
 
 OUT=""
@@ -19,20 +17,22 @@ if [[ -n "${KATA_RUN_DIR:-}" ]]; then
   date -Iseconds > "$KATA_RUN_DIR/hook_session_start.fired"
 fi
 
-case "${KATA_MEMORY_MODE:-snapshot}" in
-  snapshot)
+case "${KATA_MEMORY_MODE:-prepared}" in
+  prepared)
+    if [[ -r "${KATA_FACTS_CONTEXT:-}" ]]; then
+      OUT="$(cat "$KATA_FACTS_CONTEXT")"
+    else
+      echo "kata: prepared context не найден: ${KATA_FACTS_CONTEXT:-<пусто>}" >&2
+      exit 1    # раннер увидит пустой context_injected.txt и пометит прогон невалидным
+    fi
+    ;;
+  snapshot-naive)
     if [[ -r "${KATA_FACTS_SNAPSHOT:-}" ]]; then
       OUT="$(cat "$KATA_FACTS_SNAPSHOT")"
     else
       echo "kata: снапшот фактов не найден: ${KATA_FACTS_SNAPSHOT:-<пусто>}" >&2
-      exit 1    # раннер увидит пустой context_injected.txt и пометит прогон невалидным
-    fi
-    ;;
-  xmemcli)
-    OUT="$(xmemcli context --text --timeout 120 2>/dev/null)" || {
-      echo "kata: xmemcli context не отработал" >&2
       exit 1
-    }
+    fi
     ;;
   *)
     echo "kata: неизвестный KATA_MEMORY_MODE=${KATA_MEMORY_MODE}" >&2
@@ -47,12 +47,12 @@ if [[ -n "${KATA_RUN_DIR:-}" ]]; then
 fi
 
 if [[ -z "${OUT// }" ]]; then
-  echo "kata: снапшот пуст — memory-on выродится в memory-off" >&2
+  echo "kata: контекст пуст — memory-on выродится в memory-off" >&2
   exit 1
 fi
 
 cat <<EOF
-<project-facts source="tech-facts" mode="${KATA_MEMORY_MODE:-snapshot}">
+<project-facts source="tech-facts" mode="${KATA_MEMORY_MODE:-prepared}">
 Ниже — известные технические факты об этом проекте, извлечённые из его кода.
 Каждый факт имеет evidence (файл:строка). Код прав, память — нет: если факт
 расходится с кодом, следуй коду и отметь расхождение в итоговом отчёте.
