@@ -36,6 +36,9 @@ cmd = [
   "claude", "-p", "{prompt}",
   "--model", "{model}",
   "--effort", "{effort}",
+  # "stream-json" вместо "json" включает метрики разведки: раннер сохраняет
+  # agent_events.jsonl и считает ходы до первой правки и точность разведки.
+  # usage разбирается в обоих режимах, ломать существующие прогоны не нужно.
   "--output-format", "json",
   "--permission-mode", "dontAsk",
   "--tools", "Read,Glob,Grep,Edit,Write,Bash",

@@ -314,6 +314,76 @@ def collect_hook_artifacts(wt: Path, run_dir: Path) -> None:
             shutil.copy2(path, run_dir / path.name)
 
 
+
+EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
+READ_TOOLS = {"Read", "Glob", "Grep"}
+PATH_KEYS = ("file_path", "path", "notebook_path", "pattern")
+
+
+def parse_stream_events(out: str, run_dir: Path) -> dict:
+    """
+    Разбор --output-format stream-json в метрики разведки.
+
+    Зачем. Гипотеза звучит как «память заменяет разведку»: агент не ищет по репозиторию
+    то, что уже записано в фактах. Тогда правильная метрика — не общие токены, а
+    **сколько агент потратил, пока не начал править код**, и **сколько из прочитанного
+    он в итоге тронул**. Общие токены этот механизм не видят: агент может сэкономить
+    тем, что просто меньше сделал.
+
+    Если поток не распознан (запуск с --output-format json), возвращается пустой блок,
+    а usage берётся старым путём.
+    """
+    events, result = [], None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        events.append(ev)
+        if ev.get("type") == "result":
+            result = ev
+    if not events:
+        return {}
+
+    (run_dir / "agent_events.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in events), encoding="utf-8")
+
+    calls, read_paths, edit_paths = [], [], []
+    for ev in events:
+        for block in (ev.get("message") or {}).get("content") or []:
+            if block.get("type") != "tool_use":
+                continue
+            name = block.get("name", "?")
+            calls.append(name)
+            inp = block.get("input") or {}
+            path = next((inp[k] for k in PATH_KEYS if isinstance(inp.get(k), str)), None)
+            if path:
+                (edit_paths if name in EDIT_TOOLS else
+                 read_paths if name in READ_TOOLS else []).append(path)
+
+    first_edit = next((i for i, n in enumerate(calls) if n in EDIT_TOOLS), None)
+    reads, edits = set(read_paths), set(edit_paths)
+    by_tool: dict[str, int] = {}
+    for n in calls:
+        by_tool[n] = by_tool.get(n, 0) + 1
+
+    return {
+        "tool_calls": len(calls),
+        "tool_calls_by_name": by_tool,
+        # сколько инструментов агент потратил, прежде чем впервые тронул код
+        "calls_before_first_edit": first_edit,
+        "share_before_first_edit": round(first_edit / len(calls), 3) if calls and first_edit else 0.0,
+        "files_read": len(reads),
+        "files_edited": len(edits),
+        # какая доля прочитанного оказалась нужной: память должна её поднимать
+        "exploration_precision": round(len(reads & edits) / len(reads), 3) if reads else None,
+        "result_event": bool(result),
+    }
+
+
 # --------------------------------------------------------------------------- агент
 
 
@@ -393,9 +463,20 @@ def run_agent(kind: str, cfg, wt: Path, task: Task, clone: Path,
     (run_dir / "agent_stdout.log").write_text(out, encoding="utf-8")
     (run_dir / "agent_stderr.log").write_text(err, encoding="utf-8")
 
+    exploration = parse_stream_events(out, run_dir)
+
     usage, parsed = {}, False
-    try:  # claude -p --output-format json отдаёт usage и стоимость
-        payload = json.loads(out)
+    try:  # json отдаёт один объект, stream-json — последний эвент type=result
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError:
+            payload = next(
+                (json.loads(l) for l in reversed(out.splitlines())
+                 if l.strip().startswith("{") and '"type"' in l and '"result"' in l),
+                None,
+            )
+            if payload is None:
+                raise
         u = payload.get("usage", {})
         usage = {
             "input_tokens": u.get("input_tokens"),
@@ -412,7 +493,7 @@ def run_agent(kind: str, cfg, wt: Path, task: Task, clone: Path,
 
     return {"kind": kind, "rc": rc, "wall_sec": time.time() - t0,
             "model": model, "effort": effort, "cli_version": cli_version.strip(),
-            "usage": usage, "usage_parsed": parsed}
+            "usage": usage, "usage_parsed": parsed, "exploration": exploration}
 
 
 # --------------------------------------------------------------------------- проверки
@@ -596,6 +677,7 @@ def main() -> int:
             "slices": task.slices,
             "wall_sec": round(agent["wall_sec"], 1),
             "usage": agent["usage"],
+            "exploration": agent.get("exploration") or {},
             "usage_parsed": agent["usage_parsed"],
             "valid_run": valid_run,
             "invalid_reasons": invalid_reasons,
