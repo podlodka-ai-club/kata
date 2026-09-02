@@ -73,5 +73,6 @@ stale fact в used_facts или regression после retrieval. Где CLI не
 режимах. Только после зелёной regression, write→read и durability trace запускается full matrix с
 двумя repeats. Точные команды — в [`dataset/runner/README.md`](../dataset/runner/README.md).
 
-Зафиксированные результаты складываются в [`results/`](results/README.md). Исходная архивная
-точка: [Sonnet 5 medium, seed 1, 2026-09-01](results/2026-09-01-sonnet5-medium-seed1.md).
+Зафиксированные результаты складываются в [`results/`](results/README.md). Текущий cloud-only
+full r2: [Sonnet 5 medium, 2026-09-02](results/2026-09-02-sonnet5-xmemory-full-r2.md).
+Исходная архивная точка: [Sonnet 5 medium, seed 1, 2026-09-01](results/2026-09-01-sonnet5-medium-seed1.md).
