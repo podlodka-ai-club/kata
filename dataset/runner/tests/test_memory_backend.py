@@ -45,7 +45,10 @@ def batch(task: str, injected: list[str], create_id: str = "fact:gt-9001") -> di
             },
         }],
         "task": {"task_id": task, "title": task, "used_facts": injected[:1],
-                 "produced_facts": [create_id]},
+                 "produced_facts": [create_id],
+                 "decisions": ([{"fact_id": injected[0], "decision": "used in code",
+                                  "diff_paths": ["mealie/example.py"]}]
+                               if injected else [])},
     }
 
 
@@ -108,7 +111,12 @@ class MemoryStateMachineTest(unittest.TestCase):
         read = backend.read("a3", ["api-contracts"], "conflict")
         backend.apply({"mutations": [], "task": {"task_id": "a3", "title": "a3",
                                                    "used_facts": read.metrics["fact_ids"][:1],
-                                                   "produced_facts": []}},
+                                                   "produced_facts": [],
+                                                   "decisions": [{
+                                                       "fact_id": read.metrics["fact_ids"][0],
+                                                       "decision": "used in code",
+                                                       "diff_paths": ["mealie/example.py"],
+                                                   }]}},
                       read.metrics["fact_ids"], "a3")
         checkpoint = backend.evolve({"mutations": [], "schema_changes": [], "report": "deduped"})
         self.assertEqual(checkpoint["checkpoint"], "after-a3-before-a4")
@@ -122,6 +130,15 @@ class MemoryStateMachineTest(unittest.TestCase):
         read = backend.read("a1", ["data-ownership"], "normalization")
         bad = batch("a1", ["fact:ac-0001"])
         with self.assertRaises(MemoryError):
+            backend.apply(bad, read.metrics["fact_ids"], "a1")
+
+    def test_used_fact_requires_decision_and_diff_path_trace(self):
+        backend = self.backend("trace")
+        backend.prepare()
+        read = backend.read("a1", ["data-ownership"], "normalization")
+        bad = batch("a1", read.metrics["fact_ids"])
+        bad["task"]["decisions"] = []
+        with self.assertRaisesRegex(MemoryError, "needs a non-empty decision"):
             backend.apply(bad, read.metrics["fact_ids"], "a1")
 
     def test_xmemory_translation_keeps_task_relations_typed(self):
@@ -182,7 +199,8 @@ class FakeCloudTransport:
     def delete(self, instance_id):
         existed = instance_id in self.instances
         self.instances.pop(instance_id, None)
-        return {"provider_calls": 1, "wall_sec": 0.0, "already_deleted": not existed}
+        return {"ok": True, "instance_id": instance_id, "provider_calls": 1,
+                "wall_sec": 0.0, "already_deleted": not existed}
 
     def review_schema_suggestions(self, instance_id):
         return {"payload": {"suggestions": []}, "wall_sec": 0.0}
@@ -227,7 +245,12 @@ class XMemoryCloudLineageTest(unittest.TestCase):
         read = a3.read("a3", ["api-contracts"], "conflict")
         a3.apply({"mutations": [], "task": {"task_id": "a3", "title": "a3",
                                                 "used_facts": read.metrics["fact_ids"][:1],
-                                                "produced_facts": []}},
+                                                "produced_facts": [],
+                                                "decisions": [{
+                                                    "fact_id": read.metrics["fact_ids"][0],
+                                                    "decision": "used in code",
+                                                    "diff_paths": ["mealie/example.py"],
+                                                }]}},
                  read.metrics["fact_ids"], "a3")
         evolve = self.backend("evolve-after-a3", "memory-on+evolve")
         evolve.prepare()
@@ -268,6 +291,62 @@ class XMemoryCloudLineageTest(unittest.TestCase):
         self.assertIn("c0", self.transport.instances)
         lineage = json.loads((state_dir / "lineage.json").read_text())
         self.assertTrue(all(session.get("deleted_at") for session in lineage["sessions"]))
+
+    def test_reset_refuses_to_discard_nonempty_lineage(self):
+        first = self.backend("a1")
+        first.prepare(reset=True)
+        with self.assertRaisesRegex(MemoryError, "refusing reset of non-empty"):
+            self.backend("a1-retry").prepare(reset=True)
+
+    def test_failed_clone_verification_scoped_deletes_and_records_child(self):
+        class WrongSnapshotTransport(FakeCloudTransport):
+            def clone(self, parent_id, name, mode, seed, session_id):
+                child, metrics = super().clone(parent_id, name, mode, seed, session_id)
+                self.instances[child]["c0_sha256"] = "wrong"
+                return child, metrics
+
+        self.transport = WrongSnapshotTransport()
+        state_dir = self.root / "failed-clone"
+        backend = XMemoryBackend(state_dir, SNAPSHOT, "memory-on", 1, "c0", "a1",
+                                 transport=self.transport)
+        with self.assertRaisesRegex(MemoryError, "clone verification failed"):
+            backend.prepare(reset=True)
+        self.assertEqual(set(self.transport.instances), {"c0"})
+        lineage = json.loads((state_dir / "lineage.json").read_text())
+        child = lineage["sessions"][0]
+        self.assertEqual(child["verification"], "failed")
+        self.assertTrue(child["delete"]["ok"])
+        self.assertEqual(child["delete"]["instance_id"], child["instance_id"])
+
+    def test_precision_read_rejects_provider_fact_outside_candidates(self):
+        class ExtraFactTransport(FakeCloudTransport):
+            def retrieve(self, instance_id, task_id, slices, query, top_k, fact_ids):
+                facts, metrics = super().retrieve(
+                    instance_id, task_id, slices, query, top_k, fact_ids)
+                extra = json.loads(json.dumps(self.instances[instance_id]["facts"]["fact:do-0001"]))
+                return facts + [extra], metrics
+
+        self.transport = ExtraFactTransport()
+        backend = XMemoryBackend(
+            self.root / "strict", SNAPSHOT, "memory-on", 1, "c0", "a1",
+            transport=self.transport, retrieval_profile="precision-v1")
+        backend.prepare(reset=True)
+        with self.assertRaisesRegex(MemoryError, "outside reranked candidate set"):
+            backend.read("a1", ["api-contracts"], "shared mixin", 5,
+                         expected_fact_ids=["fact:ac-0001"],
+                         transfer_cluster="config-api-auth")
+
+    def test_cleanup_requires_exact_successful_delete_receipt(self):
+        class BadDeleteTransport(FakeCloudTransport):
+            def delete(self, instance_id):
+                return {"ok": False, "instance_id": "wrong"}
+
+        self.transport = BadDeleteTransport()
+        backend = XMemoryBackend(self.root / "bad-delete", SNAPSHOT, "memory-on", 1,
+                                 "c0", "a1", transport=self.transport)
+        backend.prepare(reset=True)
+        with self.assertRaisesRegex(MemoryError, "invalid scoped delete receipt"):
+            cleanup_xmemory_tail(self.root / "bad-delete", transport=self.transport)
 
     def test_cloud_seed_is_typed_objects_relations_plus_manifest(self):
         state = self.transport.instances["c0"]
@@ -385,6 +464,25 @@ class HookTest(unittest.TestCase):
                 capture_output=True, env=env)
             self.assertEqual(result.returncode, 2)
             self.assertIn("конфликтует с занятым ID fact:gt-0001", result.stderr)
+
+    def test_stop_hook_rejects_claimed_use_without_decision_trace(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / ".kata-run"
+            run_dir.mkdir()
+            context = Path(td) / "context.json"
+            context.write_text(json.dumps({"facts": [{"fact_id": "fact:ac-0004"}]}))
+            (run_dir / "memory_update_done.marker").write_text("1")
+            payload = batch("a3", ["fact:ac-0004"])
+            payload["task"]["decisions"] = []
+            (run_dir / "memory_mutations.json").write_text(json.dumps(payload))
+            env = {**os.environ, "KATA_RUN_DIR": str(run_dir), "KATA_TASK_ID": "a3",
+                   "KATA_FACTS_CONTEXT": str(context)}
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "dataset" / "hooks" / "stop.py")],
+                input=json.dumps({"stop_hook_active": True}), text=True,
+                capture_output=True, env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("требует decisions с decision и diff_paths", result.stderr)
 
     def test_session_start_injects_exact_prepared_context_and_logs_it(self):
         with tempfile.TemporaryDirectory() as directory:

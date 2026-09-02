@@ -35,21 +35,25 @@ feature_lift = (agent_passed - null_passed) / (oracle_passed - null_passed)
 зажимается. Micro hidden ratio и binary `task_success` остаются secondary diagnostics.
 
 `valid_run` означает техническую валидность: agent rc/usage/CLI, memory read+write и junit
-разобраны. `analytical_eligible` дополнительно требует зелёную regression и запрещает
-изменение/удаление существующих tests. Добавленные tests считаются отдельно и видны в diff.
+разобраны. `analytical_eligible` дополнительно требует зелёную regression и pristine base tests.
+В precision-v1 существующие tests физически immutable во время coding, а новые разрешены только
+в `agent_tests/`. Hash/mode/git-index proof выполняется до memory write и scoring.
 
 Перед regression runner восстанавливает весь pristine `tests/` из base commit, затем накладывает
 hidden tests эталонного PR. Поэтому ослабление теста агентом не может повысить score. Красная
 regression и test interference остаются в CSV, но исключаются из primary comparison.
 
-Summary считается macro по задачам внутри seed, затем показывает median/range по трём repeats.
-Один seed — наблюдение, не каузальный вывод.
+Primary comparison дополнительно paired: `task/seed` входит в агрегацию только если все режимы
+ячейки одновременно valid и eligible. Непарные technically valid rows сохраняются как diagnostics.
+Summary считается macro по задачам внутри seed, затем показывает median/range по repeats. Один
+seed — наблюдение, не каузальный вывод.
 
 ## Retrieval, architecture и attribution
 
-Заранее объявленные `task.slices` и `expected_facts` не попадают в prompt. File fallback
-детерминированно фильтрует sections по slices и text score; xmemory получает scoped/top-k query.
-Логируются exact injected ID/content, chars/tokens, precision/coverage и irrelevant facts.
+Заранее объявленные `task.slices` и `expected_facts` не попадают в prompt. Precision-v1 допускает
+только объявленные C0 facts и не более одного validated learned fact того же cluster, применяет
+threshold/top-k и исключает sandbox/tooling gotchas. Логируются exact ID/content/origin,
+selection reason, chars/tokens, precision/coverage и rejected facts.
 
 Для class A в `tasks.yaml` заранее объявлены deterministic `required_path_groups` и forbidden
 shortcuts: migration, expected layer, repository/controller convention, tenant scope. Они не
@@ -69,10 +73,14 @@ stale fact в used_facts или regression после retrieval. Где CLI не
 - config/API/auth: `a2→a4→a5`;
 - data/repository/invariants: `a1→a3→a6`.
 
-Сначала бесплатные fake/null/oracle gates. Затем один платный canary `a3→evolve→a6` во всех трёх
-режимах. Только после зелёной regression, write→read и durability trace запускается full matrix с
-двумя repeats. Точные команды — в [`dataset/runner/README.md`](../dataset/runner/README.md).
+Сначала бесплатные fake/null/oracle/test-protection и real xmemory durability gates. Precision-v1
+canary использовал `a1→a4→a6`, а в evolve stream — `a1→a4→curator→a6`. Full разрешён только при
+9/9 valid, полной paired eligibility, зелёной regression/attribution/protection/retention и
+неизменном C0. Canary gate упал на `a6/on+evolve`, поэтому новый full не запускался. Точные команды
+— в [`dataset/runner/README.md`](../dataset/runner/README.md).
 
-Зафиксированные результаты складываются в [`results/`](results/README.md). Текущий cloud-only
-full r2: [Sonnet 5 medium, 2026-09-02](results/2026-09-02-sonnet5-xmemory-full-r2.md).
+Зафиксированные результаты складываются в [`results/`](results/README.md). Текущий precision
+canary: [Sonnet 5 medium, gate FAIL, 2026-09-02](results/2026-09-02-sonnet5-xmemory-precision-v1-canary.md).
+Предыдущий cloud-only full r2:
+[Sonnet 5 medium, 2026-09-02](results/2026-09-02-sonnet5-xmemory-full-r2.md).
 Исходная архивная точка: [Sonnet 5 medium, seed 1, 2026-09-01](results/2026-09-01-sonnet5-medium-seed1.md).

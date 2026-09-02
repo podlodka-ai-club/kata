@@ -34,13 +34,16 @@
 ## Текущий исследовательский протокол
 
 Первый seed из PR #8 сохранён как архивный **naive full-snapshot negative control**: read-only
-memory-on получал один полный dump. Новый primary protocol реализует три отдельных stream и не
-переписывает старые результаты. Сначала запускаются бесплатные fake/null/oracle gates, затем canary
-`a3 → a6` одним seed. Полная матрица `6 tasks × 3 modes × 2 repeats` разрешена только после зелёного
-canary; отчёт показывает оба seed и median/range, а не трактует один seed каузально.
+memory-on получал один полный dump. Новый precision-v1 protocol реализует три отдельных stream и
+не переписывает старые результаты. Перед Claude проходят fake/null/oracle, physical test-protection
+и real xmemory durability gates. Canary `a1 → a4 → a6` использует строгий top-k/threshold и paired
+eligibility. Полная матрица `6 tasks × 3 modes × 2 repeats` разрешена только после зелёного canary.
+Canary 2026-09-02 gate не прошёл из-за regression в `a6/on+evolve`, поэтому новый full не запускался
+([отчёт](evals/results/2026-09-02-sonnet5-xmemory-precision-v1-canary.md)).
 
-В memory modes порядок семантически значим:
-`a1 → a2 → a3 → [evolve только в третьем режиме] → a4 → a5 → a6`. Каждая задача — новая
+В full memory modes порядок семантически значим:
+`a1 → a2 → a3 → [evolve только в третьем режиме] → a4 → a5 → a6`. Canary поставил curator
+после a4, чтобы a6 была единственной post-transfer задачей. Каждая задача — новая
 coding-session и независимый code workspace. Перед каждой memory-сессией создаётся новый xmemory
 child: a1 клонируется из read-only C0 template, следующая сессия — из предыдущего child. Поэтому
 memory state переживает рестарт только через xmemory, а mutable instance никогда не делится между

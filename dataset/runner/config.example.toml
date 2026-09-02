@@ -1,6 +1,10 @@
 # Скопировать в config.toml и поправить под себя.
 # Провайдер и лимиты живут здесь, а не в коде: каждый жжёт свои токены.
 
+[experiment]
+id = "sonnet5-xmemory-precision-v1"
+curator_after_task = "a3"
+
 [repo]
 url = "https://github.com/mealie-recipes/mealie.git"
 clone = ".cache/mealie"                 # reference clone; агент его историю не получает
@@ -58,7 +62,10 @@ backend = "xmemory"                    # xmemory | file
 require_xmemory_for_memory_modes = true
 snapshot = "dataset/facts/snapshot-c0.md"
 retrieval = "task-slices"
-top_k = 20
+retrieval_profile = "precision-v1"
+top_k = 5
+relevance_threshold = 0.75
+learned_top_k = 1
 xmemcli = "xmemcli"
 instance_name_prefix = "kata"
 

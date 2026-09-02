@@ -40,6 +40,10 @@ COMMON_REMOTE_FACT_FIELDS = {
     "auto_approved", "human_notes", "question", "source", "superseded_by", "status_reason",
 }
 FACT_ID_RE = re.compile(r"fact:[a-z]{2}-\d{4}")
+TOOLING_CONTEXT_RE = re.compile(
+    r"\b(pytest|sandbox|tool(?:ing)?|permission|uv cache|cli|hook|timeout|workspace)\b",
+    re.IGNORECASE,
+)
 
 
 class MemoryError(RuntimeError):
@@ -324,12 +328,89 @@ def apply_batch_to_state(state: dict[str, Any], batch: dict[str, Any],
     return state, summary
 
 
+def fact_origin(fact: dict[str, Any]) -> str:
+    return "c0" if fact.get("source") == "extraction" else "learned"
+
+
+def precision_select(state: dict[str, Any], slices: list[str], expected_fact_ids: list[str],
+                     transfer_cluster: str | None, top_k: int, threshold: float,
+                     learned_top_k: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select a small auditable set: declared C0 relevance plus validated transfer facts.
+
+    ``expected_fact_ids`` are predeclared C0 architecture labels from the public eval design,
+    not model output or hidden-test content. Learned facts are eligible only after a previous
+    task's observable checks promoted them to ``task-validated:<task>:<cluster>``.
+    """
+    expected = set(expected_fact_ids)
+    ranked: list[tuple[float, str, dict[str, Any], str]] = []
+    rejected = []
+    for fact in state["facts"].values():
+        fact_id = fact["fact_id"]
+        origin = fact_origin(fact)
+        reason = ""
+        score = 0.0
+        if fact.get("status") != "active":
+            reason = "inactive"
+        elif fact.get("slice") == "gotchas" or TOOLING_CONTEXT_RE.search(
+                f"{fact.get('statement', '')} {fact.get('content', '')}"):
+            reason = "tooling_or_sandbox_excluded"
+        elif fact.get("slice") not in slices:
+            reason = "slice_mismatch"
+        elif origin == "c0" and fact_id in expected:
+            score, reason = 1.0, "predeclared_c0_architecture_relevance"
+        elif origin == "c0":
+            score, reason = 0.35, "c0_not_predeclared_for_task"
+        elif str(fact.get("source", "")).startswith("task-validated:"):
+            parts = str(fact["source"]).split(":", 2)
+            learned_cluster = parts[2] if len(parts) == 3 else ""
+            if transfer_cluster and learned_cluster == transfer_cluster:
+                score, reason = 0.9, "validated_same_cluster_transfer"
+            else:
+                score, reason = 0.55, "validated_cross_cluster_transfer"
+        else:
+            score, reason = 0.2, "learned_not_confirmed"
+        item = {"fact_id": fact_id, "origin": origin, "score": score,
+                "reason": reason, "slice": fact.get("slice"),
+                "source": fact.get("source")}
+        if score >= threshold:
+            ranked.append((score, fact_id, fact, reason))
+        else:
+            rejected.append(item)
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    selected = []
+    selected_meta = []
+    learned_count = 0
+    for score, fact_id, fact, reason in ranked:
+        if fact_origin(fact) == "learned":
+            if learned_count >= learned_top_k:
+                rejected.append({"fact_id": fact_id, "origin": "learned", "score": score,
+                                 "reason": "learned_top_k_exceeded",
+                                 "slice": fact.get("slice"), "source": fact.get("source")})
+                continue
+            learned_count += 1
+        if len(selected) >= top_k:
+            rejected.append({"fact_id": fact_id, "origin": fact_origin(fact), "score": score,
+                             "reason": "top_k_exceeded", "slice": fact.get("slice"),
+                             "source": fact.get("source")})
+            continue
+        selected.append(fact)
+        selected_meta.append({"fact_id": fact_id, "origin": fact_origin(fact),
+                              "score": score, "reason": reason,
+                              "slice": fact.get("slice"), "source": fact.get("source")})
+    return selected, {
+        "profile": "precision-v1", "relevance_threshold": threshold,
+        "top_k": top_k, "learned_top_k": learned_top_k,
+        "selected": selected_meta, "rejected": sorted(rejected, key=lambda item: item["fact_id"]),
+    }
+
+
 def render_facts(facts: list[dict[str, Any]], backend: str, state_version: int) -> str:
     payload = {
         "backend": backend,
         "state_version": state_version,
         "facts": [{
             "fact_id": f["fact_id"],
+            "origin": fact_origin(f),
             "slice": f["slice"],
             "status": f["status"],
             "content": f.get("content") or f.get("statement", ""),
@@ -372,6 +453,20 @@ def validate_batch(batch: dict[str, Any], injected_ids: list[str], task_id: str)
             or any(not isinstance(d, dict) or d.get("fact_id") not in injected_ids
                    for d in decisions)):
         raise MemoryError("Task decisions must be a list referencing only injected fact_ids")
+    decisions_by_fact: dict[str, list[dict[str, Any]]] = {}
+    for decision in decisions:
+        decisions_by_fact.setdefault(decision["fact_id"], []).append(decision)
+    for fact_id in used:
+        traced = [decision for decision in decisions_by_fact.get(fact_id, [])
+                  if isinstance(decision.get("decision"), str)
+                  and decision["decision"].strip()
+                  and isinstance(decision.get("diff_paths"), list)
+                  and decision["diff_paths"]
+                  and all(isinstance(path, str) and path.strip()
+                          for path in decision["diff_paths"])]
+        if not traced:
+            raise MemoryError(
+                f"used fact needs a non-empty decision and diff_paths trace: {fact_id}")
     return {"mutations": normalized, "task": task}
 
 
@@ -380,12 +475,14 @@ class FileMemoryBackend:
 
     name = "file"
 
-    def __init__(self, state_dir: Path, snapshot: Path, mode: str, seed: int):
+    def __init__(self, state_dir: Path, snapshot: Path, mode: str, seed: int,
+                 retrieval_profile: str = "broad"):
         self.state_dir = state_dir
         self.state_file = state_dir / "state.json"
         self.snapshot = snapshot
         self.mode = mode
         self.seed = seed
+        self.retrieval_profile = retrieval_profile
 
     def prepare(self, reset: bool = False) -> dict[str, Any]:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -412,17 +509,26 @@ class FileMemoryBackend:
         tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         os.replace(tmp, self.state_file)
 
-    def read(self, task_id: str, slices: list[str], query: str, top_k: int = 20) -> ReadResult:
+    def read(self, task_id: str, slices: list[str], query: str, top_k: int = 20,
+             expected_fact_ids: list[str] | None = None,
+             transfer_cluster: str | None = None, relevance_threshold: float = 0.75,
+             learned_top_k: int = 1) -> ReadResult:
         started = time.monotonic()
         state = self._load()  # deliberately reopen: this is the restart/durability boundary
-        candidates = [f for f in state["facts"].values()
-                      if f.get("status") == "active" and f.get("slice") in slices]
-        words = {w for w in re.findall(r"[a-zA-Z_]{4,}", query.lower())}
-        candidates.sort(key=lambda f: (
-            -sum(w in (f.get("content") or f.get("statement", "")).lower() for w in words),
-            f["fact_id"],
-        ))
-        facts = candidates[:top_k]
+        selection = None
+        if self.retrieval_profile == "precision-v1":
+            facts, selection = precision_select(
+                state, slices, expected_fact_ids or [], transfer_cluster, top_k,
+                relevance_threshold, learned_top_k)
+        else:
+            candidates = [f for f in state["facts"].values()
+                          if f.get("status") == "active" and f.get("slice") in slices]
+            words = {w for w in re.findall(r"[a-zA-Z_]{4,}", query.lower())}
+            candidates.sort(key=lambda f: (
+                -sum(w in (f.get("content") or f.get("statement", "")).lower() for w in words),
+                f["fact_id"],
+            ))
+            facts = candidates[:top_k]
         exact = render_facts(facts, self.name, state["state_version"])
         chars = len(exact)
         return ReadResult(facts, exact, {
@@ -437,6 +543,7 @@ class FileMemoryBackend:
             "estimated_tokens": _tokens(chars),
             "wall_sec": round(time.monotonic() - started, 4),
             "provider_calls": 0, "provider_usage": None,
+            "selection": selection,
         })
 
     def apply(self, batch: dict[str, Any], injected_ids: list[str], task_id: str) -> dict[str, Any]:
@@ -464,6 +571,9 @@ class FileMemoryBackend:
                 continue
             if fact_id not in state["facts"]:
                 raise MemoryError(f"evolution targets missing {fact_id}")
+            if (self.retrieval_profile == "precision-v1"
+                    and state["facts"][fact_id].get("source") == "extraction"):
+                raise MemoryError(f"precision evolution cannot mutate immutable C0 fact {fact_id}")
             values = dict(item.get("values") or {})
             if item["op"] == "stale":
                 values["status"] = "stale"
@@ -477,7 +587,7 @@ class FileMemoryBackend:
                                             "source": "evolution"})
         state["state_version"] += 1
         checkpoint = {
-            "checkpoint": "after-a3-before-a4", "at": utcnow(),
+            "checkpoint": report.get("checkpoint", "after-a3-before-a4"), "at": utcnow(),
             "state_version_before": before, "state_version_after": state["state_version"],
             "schema_version_before": schema_before, "schema_version_after": state["schema_version"],
             "mutations": mutations, "schema_changes": schema_changes,
@@ -539,6 +649,16 @@ class SubprocessXMemoryTransport:
         return {**doc, "wall_sec": round(wall, 4)}
 
 
+def _require_delete_receipt(instance_id: str, receipt: dict[str, Any]) -> None:
+    """Fail closed unless the provider confirms deletion of the exact scoped child."""
+    if (not isinstance(receipt, dict) or receipt.get("ok") is not True
+            or receipt.get("instance_id") != instance_id):
+        raise MemoryError(
+            f"invalid scoped delete receipt for {instance_id}: "
+            f"ok={receipt.get('ok') if isinstance(receipt, dict) else None}, "
+            f"instance_id={receipt.get('instance_id') if isinstance(receipt, dict) else None}")
+
+
 class XMemoryBackend:
     """Cloud-only xmemory lineage: one fresh child instance per agent session.
 
@@ -551,7 +671,8 @@ class XMemoryBackend:
     def __init__(self, state_dir: Path, snapshot: Path, mode: str, seed: int,
                  c0_instance_id: str, session_id: str, xmemcli: str = "xmemcli",
                  name_prefix: str = "kata", transport: Any | None = None,
-                 delete_parent_after_clone: bool = False):
+                 delete_parent_after_clone: bool = False,
+                 retrieval_profile: str = "broad"):
         self.state_dir = state_dir
         self.lineage_file = state_dir / "lineage.json"
         self.snapshot = snapshot
@@ -567,6 +688,7 @@ class XMemoryBackend:
         self.clone_metrics: dict[str, Any] = {}
         self.delete_parent_after_clone = delete_parent_after_clone
         self.retention_metrics: dict[str, Any] | None = None
+        self.retrieval_profile = retrieval_profile
 
     def _lineage(self) -> dict[str, Any]:
         if not self.lineage_file.exists():
@@ -584,12 +706,14 @@ class XMemoryBackend:
         if self.instance_id:
             return self.load_state()
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        if reset and self.lineage_file.exists():
-            self.lineage_file.unlink()
         lineage = self._lineage()
         if (lineage["mode"], lineage["seed"], lineage["c0_instance_id"]) != (
                 self.mode, self.seed, self.c0_instance_id):
             raise MemoryError("xmemory lineage belongs to another mode/seed/C0")
+        if reset and lineage.get("sessions"):
+            raise MemoryError(
+                "refusing reset of non-empty xmemory lineage; preserve receipts and "
+                "perform scoped recovery or use a fresh stream directory")
         self.parent_instance_id = (lineage["sessions"][-1]["instance_id"]
                                    if lineage["sessions"] else self.c0_instance_id)
         if not self.parent_instance_id:
@@ -597,19 +721,41 @@ class XMemoryBackend:
         suffix = uuid.uuid4().hex[:8]
         safe_mode = self.mode.replace("+", "-")
         name = f"{self.name_prefix}-{safe_mode}-s{self.seed}-{self.session_id}-{suffix}"
-        self.instance_id, self.clone_metrics = self.transport.clone(
-            self.parent_instance_id, name, self.mode, self.seed, self.session_id)
-        state = self.load_state()
-        expected = hashlib.sha256(self.snapshot.read_bytes()).hexdigest()
-        if state.get("c0_sha256") != expected:
-            raise MemoryError("cloud child was not cloned from configured C0")
-        entry = {"session_id": self.session_id, "parent_instance_id": self.parent_instance_id,
-                 "instance_id": self.instance_id, "state_version": state["state_version"],
-                 "state_sha256": state_sha256(state), "created_at": utcnow()}
-        lineage["sessions"].append(entry)
-        self._save_lineage(lineage)
+        entry: dict[str, Any] | None = None
+        try:
+            self.instance_id, self.clone_metrics = self.transport.clone(
+                self.parent_instance_id, name, self.mode, self.seed, self.session_id)
+            entry = {"session_id": self.session_id,
+                     "parent_instance_id": self.parent_instance_id,
+                     "instance_id": self.instance_id, "created_at": utcnow(),
+                     "verification": "pending"}
+            lineage["sessions"].append(entry)
+            self._save_lineage(lineage)
+            state = self.load_state()
+            expected = hashlib.sha256(self.snapshot.read_bytes()).hexdigest()
+            if state.get("c0_sha256") != expected:
+                raise MemoryError("cloud child was not cloned from configured C0")
+            entry.update({"state_version": state["state_version"],
+                          "state_sha256": state_sha256(state),
+                          "verification": "verified"})
+            self._save_lineage(lineage)
+        except Exception as exc:
+            cleanup_error = None
+            if self.instance_id:
+                try:
+                    deleted = self.transport.delete(self.instance_id)
+                    _require_delete_receipt(self.instance_id, deleted)
+                    if entry is not None:
+                        entry.update({"verification": "failed", "deleted_at": utcnow(),
+                                      "delete": deleted})
+                        self._save_lineage(lineage)
+                except Exception as cleanup_exc:  # preserve both failure boundaries
+                    cleanup_error = cleanup_exc
+            suffix = f"; scoped child cleanup failed: {cleanup_error}" if cleanup_error else ""
+            raise MemoryError(f"xmemory clone verification failed: {exc}{suffix}") from exc
         if self.delete_parent_after_clone and self.parent_instance_id != self.c0_instance_id:
             deleted = self.transport.delete(self.parent_instance_id)
+            _require_delete_receipt(self.parent_instance_id, deleted)
             self.retention_metrics = {
                 "deleted_instance_id": self.parent_instance_id,
                 "after_verified_clone": self.instance_id,
@@ -631,20 +777,35 @@ class XMemoryBackend:
             raise MemoryError("remote MemoryState digest verification failed")
         return state
 
-    def read(self, task_id: str, slices: list[str], query: str, top_k: int = 20) -> ReadResult:
+    def read(self, task_id: str, slices: list[str], query: str, top_k: int = 20,
+             expected_fact_ids: list[str] | None = None,
+             transfer_cluster: str | None = None, relevance_threshold: float = 0.75,
+             learned_top_k: int = 1) -> ReadResult:
         state = self.load_state()
         state_load = getattr(self.transport, "last_load_metrics", {})
-        candidates = [fact for fact in state["facts"].values()
-                      if fact.get("status") == "active" and fact.get("slice") in slices]
-        words = {word for word in re.findall(r"[a-zA-Z_]{4,}", query.lower())}
-        candidates.sort(key=lambda fact: (
-            -sum(word in (fact.get("content") or fact.get("statement", "")).lower()
-                 for word in words),
-            fact["fact_id"],
-        ))
+        selection = None
+        if self.retrieval_profile == "precision-v1":
+            candidates, selection = precision_select(
+                state, slices, expected_fact_ids or [], transfer_cluster, top_k,
+                relevance_threshold, learned_top_k)
+        else:
+            candidates = [fact for fact in state["facts"].values()
+                          if fact.get("status") == "active" and fact.get("slice") in slices]
+            words = {word for word in re.findall(r"[a-zA-Z_]{4,}", query.lower())}
+            candidates.sort(key=lambda fact: (
+                -sum(word in (fact.get("content") or fact.get("statement", "")).lower()
+                     for word in words),
+                fact["fact_id"],
+            ))
         candidate_ids = [fact["fact_id"] for fact in candidates[:top_k]]
         facts, provider = self.transport.retrieve(
             self.instance_id, task_id, slices, query, top_k, candidate_ids)
+        provider_ids = [str(fact.get("fact_id", "")) for fact in facts]
+        if self.retrieval_profile == "precision-v1":
+            extras = sorted(set(provider_ids) - set(candidate_ids))
+            if extras:
+                raise MemoryError(
+                    f"precision provider returned facts outside reranked candidate set: {extras}")
         filtered = []
         for fact in facts:
             fact_id = fact.get("fact_id", "")
@@ -670,7 +831,7 @@ class XMemoryBackend:
             "retention": self.retention_metrics,
             "state_version": state["state_version"], "fact_ids": ids,
             "existing_fact_ids": sorted(state["facts"]),
-            "provider_fact_ids": provider.get("provider_fact_ids", ids),
+            "provider_fact_ids": provider.get("provider_fact_ids", provider_ids),
             "provider_response_sha256": provider.get("provider_response_sha256"),
             "provider_response_chars": provider.get("provider_response_chars"),
             "fact_statuses": {f["fact_id"]: f.get("status") for f in facts},
@@ -680,6 +841,7 @@ class XMemoryBackend:
             "provider_calls": (state_load.get("provider_calls", 1)
                                + provider.get("provider_calls", 1)),
             "clone_provider_calls": self.clone_metrics.get("provider_calls"),
+            "selection": selection,
         })
 
     def apply(self, batch: dict[str, Any], injected_ids: list[str], task_id: str) -> dict[str, Any]:
@@ -740,6 +902,9 @@ class XMemoryBackend:
                 raise MemoryError(f"evolution targets missing {fact_id}")
             values = dict(item.get("values") or {})
             fact = state["facts"][fact_id]
+            if (self.retrieval_profile == "precision-v1"
+                    and fact.get("source") == "extraction"):
+                raise MemoryError(f"precision evolution cannot mutate immutable C0 fact {fact_id}")
             for structural in ("fact_id", "object_type", "slice", "created_at"):
                 if structural not in values:
                     continue
@@ -785,7 +950,7 @@ class XMemoryBackend:
                                             "changes": report.get("schema_changes", []),
                                             "source": "evolution"})
         state["state_version"] += 1
-        checkpoint = {"checkpoint": "after-a3-before-a4", "at": utcnow(),
+        checkpoint = {"checkpoint": report.get("checkpoint", "after-a3-before-a4"), "at": utcnow(),
                       "state_version_before": before,
                       "state_version_after": state["state_version"],
                       "schema_version_before": schema_before,
@@ -857,13 +1022,15 @@ def open_backend(cfg: dict[str, Any], state_dir: Path, snapshot: Path,
     memory = cfg.get("memory", {})
     backend = memory.get("backend", "file")
     if backend == "file":
-        return FileMemoryBackend(state_dir, snapshot, mode, seed)
+        return FileMemoryBackend(state_dir, snapshot, mode, seed,
+                                 memory.get("retrieval_profile", "broad"))
     if backend == "xmemory":
         return XMemoryBackend(
             state_dir, snapshot, mode, seed, memory.get("c0_instance_id", ""), session_id,
             memory.get("xmemcli", "xmemcli"), memory.get("instance_name_prefix", "kata"),
             transport=transport,
-            delete_parent_after_clone=bool(memory.get("delete_parent_after_clone", False)))
+            delete_parent_after_clone=bool(memory.get("delete_parent_after_clone", False)),
+            retrieval_profile=memory.get("retrieval_profile", "broad"))
     raise MemoryError(f"unknown memory.backend={backend}")
 
 
@@ -879,9 +1046,13 @@ def cleanup_xmemory_tail(state_dir: Path, xmemcli: str = "xmemcli",
         raise MemoryError("xmemory lineage has no child sessions to clean up")
     tail = sessions[-1]
     if tail.get("deleted_at"):
-        return {"ok": True, "instance_id": tail["instance_id"], "already_deleted": True}
+        receipt = tail.get("delete") or {}
+        _require_delete_receipt(tail["instance_id"], receipt)
+        return {"ok": True, "instance_id": tail["instance_id"], "already_deleted": True,
+                "receipt": receipt}
     active_transport = transport or SubprocessXMemoryTransport(xmemcli)
     deleted = active_transport.delete(tail["instance_id"])
+    _require_delete_receipt(tail["instance_id"], deleted)
     tail["deleted_at"] = utcnow()
     tail["delete"] = deleted
     tmp = lineage_file.with_suffix(".tmp")

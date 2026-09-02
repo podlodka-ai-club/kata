@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the isolated curator checkpoint after a3 and before a4."""
+"""Run an isolated curator checkpoint after a configured transfer boundary."""
 
 from __future__ import annotations
 
@@ -20,11 +20,17 @@ from memory_backend import MemoryError, open_backend
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def prompt() -> str:
-    return """You are the memory curator, not a coding agent. This is the checkpoint after a3
-and before a4. You cannot see a repository, future tasks, solution commits, or hidden tests.
+def curator_session_id(after_task: str) -> str:
+    return f"evolve-after-{after_task}"
+
+
+def prompt(after_task: str) -> str:
+    return """You are the memory curator, not a coding agent. This is the checkpoint after AFTER_TASK
+and before the next task. You cannot see a repository, future tasks, solution commits, or hidden tests.
 Review only cloud_memory_state.json, exported for this isolated session from its fresh xmemory
 child: candidates, gotchas, questions, contradictions and duplicate facts.
+Facts whose source is `extraction` are the immutable C0 layer: do not update or stale them.
+Curate only learned facts created by completed tasks.
 Code evidence recorded in facts wins over memory prose. You may update or stale existing facts;
 you must not create coding-solution facts. `fact_id`, `object_type`, `slice`, and `created_at` are
 immutable: never put them in values and never re-type a fact. If a fact is mistyped, mark it stale
@@ -38,7 +44,8 @@ Write evolution_report.json with this exact shape:
  "apply_schema_suggestions":false,
  "confirm_destructive_preview_reviewed":false,
  "report":"short curator report"}.
-An empty list is valid. Do not edit any other file and do not solve a coding task."""
+An empty list is valid. Do not edit any other file and do not solve a coding task.""".replace(
+        "AFTER_TASK", after_task)
 
 
 def parse_usage(output: str) -> tuple[dict, bool]:
@@ -64,13 +71,14 @@ def main() -> int:
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--memory-state", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--after-task", default="a3")
     ap.add_argument("--agent", choices=["claude", "fake"], default=None)
     args = ap.parse_args()
 
     cfg = tomllib.loads((ROOT / args.config).read_text(encoding="utf-8"))
     snapshot = (ROOT / cfg["memory"]["snapshot"]).resolve()
     backend = open_backend(cfg, (ROOT / args.memory_state).resolve(), snapshot, args.mode, args.seed,
-                           session_id="evolve-after-a3")
+                           session_id=curator_session_id(args.after_task))
     backend.prepare(reset=False)
     state = backend.load_state()
     schema_review = None
@@ -99,7 +107,7 @@ def main() -> int:
             (wt / ".claude" / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
             model = cfg["agent"]["model"]
             effort = cfg["agent"]["effort"]
-            cmd = [part.replace("{prompt}", prompt()).replace("{model}", model)
+            cmd = [part.replace("{prompt}", prompt(args.after_task)).replace("{model}", model)
                    .replace("{effort}", effort) for part in cfg["agent"]["cmd"]]
             started = time.monotonic()
             result = subprocess.run(cmd, cwd=wt, text=True, capture_output=True,
@@ -117,6 +125,7 @@ def main() -> int:
         finally:
             shutil.rmtree(wt, ignore_errors=True)
 
+    report["checkpoint"] = f"after-{args.after_task}-before-next"
     try:
         backend_started = time.monotonic()
         checkpoint = backend.evolve(report)
@@ -132,6 +141,7 @@ def main() -> int:
         "wall_sec": round(wall, 3), "state_version_before": before,
         "backend_wall_sec": round(backend_wall, 3),
         "schema_review": schema_review,
+        "retention": getattr(backend, "retention_metrics", None),
         "state_version_after": checkpoint["state_version_after"],
         "checkpoint": checkpoint, "report": report,
     }

@@ -30,12 +30,12 @@ INSTRUCTION = """\
 
 Задача закончена. Прогони запись через гейт новизны и обнови память фактов:
 
-1. Что из фактов, приехавших в начале сессии, разошлось с кодом — пометь stale
-   со status_reason и заведи новый candidate. Код прав, память нет.
+1. Факты с origin=c0 — неизменяемый стартовый слой: не update/stale их. Если код
+   разошёлся с C0, создай отдельный learned candidate с evidence.
 2. Что реально появилось в системе (endpoint, зависимость, событие, инвариант,
    настройка) — новые candidate-факты с evidence вида файл:строка.
-3. На какие грабли наступил сам (упавшая сборка, поймавший регресс тест,
-   требование проверки репозитория) — факт gotcha, только как гипотеза.
+3. Sandbox/tooling/pytest/permission-грабли не являются product architecture и в
+   память этого precision-эксперимента не записываются.
 4. Оставь след задачи: объект Task со связями used_facts и produced_facts по fact_id.
 
 Перед выбором нового fact_id прочитай `.kata-hooks/existing-fact-ids.json`: там только занятые
@@ -53,7 +53,9 @@ ID текущего cloud state. Новый ID обязан иметь ровн�
 "decision":"какое решение в коде изменил прочитанный факт","diff_paths":["path/to/file.py"]}]}}.
 Ссылаться в used_facts можно только на ID из стартового контекста. produced_facts — только ID
 реальных create/update/stale этого батча. Если устойчивых изменений нет, mutations может быть
-пустым, но Task и used_facts всё равно обязательны. Не переписывай соседние факты «заодно».
+пустым, но Task и used_facts всё равно обязательны. Для каждого used_facts обязателен decisions
+с непустыми decision и diff_paths; если факт не повлиял на код, не помечай его used.
+Не переписывай соседние факты «заодно».
 Runner проверит схему и применит её через настроенный backend после завершения этой сессии.
 
 Перед завершением перечитай созданный JSON. У КАЖДОГО op=create, независимо от slice/status,
@@ -145,6 +147,23 @@ def validate_batch(path: Path, task_id: str) -> list[str]:
             errors.append("used_facts содержит ID вне стартового контекста")
         if set(produced) - changed:
             errors.append("produced_facts содержит ID без create/update/stale")
+        decisions = task.get("decisions")
+        if not isinstance(decisions, list):
+            errors.append("task.decisions должен быть массивом")
+        else:
+            for fact_id in used:
+                traced = [decision for decision in decisions
+                          if isinstance(decision, dict)
+                          and decision.get("fact_id") == fact_id
+                          and isinstance(decision.get("decision"), str)
+                          and decision["decision"].strip()
+                          and isinstance(decision.get("diff_paths"), list)
+                          and decision["diff_paths"]
+                          and all(isinstance(value, str) and value.strip()
+                                  for value in decision["diff_paths"])]
+                if not traced:
+                    errors.append(
+                        f"used fact {fact_id} требует decisions с decision и diff_paths")
     return errors
 
 
