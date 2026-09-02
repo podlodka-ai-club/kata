@@ -1,5 +1,15 @@
 # Memory-off vs memory-on: Sonnet 5 medium, seed 1
 
+> **Архивный negative control: naive full-snapshot dump.** Эти числа сохранены без
+> пересчёта как исходная точка PR #8. `memory-on` здесь read-only (`write_back=false`) и получает
+> один полный одинаковый snapshot во все задачи. Это не новый primary read/write протокол и не
+> результат режима `memory-on+evolve`.
+
+По новому протоколу эти строки не пересчитываются задним числом: в старых артефактах нет
+write/read state versions, mutation provenance и evolution checkpoint. Красные regressions и
+изменение существующих tests были бы аналитически неeligible; это ещё одна причина использовать
+baseline только как исходную negative-control точку.
+
 Дата прогона: **2026-09-01**. Это первый end-to-end baseline этапа 1 на шести задачах Mealie.
 Он нужен для проверки протокола и оценки порядка величин, но одного повтора недостаточно для
 каузального вывода о влиянии памяти.

@@ -1,0 +1,49 @@
+{
+  "audit": "precision-canary-v1-post-run-hardened",
+  "source": "offline recomputation from immutable canary row and lineage artifacts",
+  "original_canary_gate_artifact_preserved": true,
+  "passed": false,
+  "checks": {
+    "canary_shape_exact": true,
+    "rows_technically_valid": true,
+    "every_task_seed_paired_eligible": false,
+    "test_protection_preflight_passed": true,
+    "base_tests_pristine": true,
+    "regression_green": false,
+    "metrics_attribution_complete": false,
+    "retrieval_precision_materially_higher": true,
+    "retrieval_coverage_complete": true,
+    "retrieval_no_hidden_leakage": true,
+    "expected_children_with_delete_receipts": false,
+    "c0_digest_unchanged": true
+  },
+  "expected_rows": 9,
+  "actual_rows": 9,
+  "paired_cells": {
+    "a1/seed1": {"paired_eligible": true, "reasons": []},
+    "a4/seed1": {"paired_eligible": true, "reasons": []},
+    "a6/seed1": {
+      "paired_eligible": false,
+      "reasons": ["memory-on+evolve:regression_red"]
+    }
+  },
+  "retrieval_precision_median": 1.0,
+  "retrieval_precision_range": [0.8, 1.0],
+  "retrieval_coverage_range": [1.0, 1.0],
+  "expected_children": 7,
+  "actual_children": 7,
+  "valid_scoped_delete_receipts": 7,
+  "verified_parent_transitions": 4,
+  "expected_parent_transitions": 5,
+  "retention_issues": [
+    "legacy curator session label is evolve-after-a3 instead of evolve-after-a4",
+    "legacy evolution artifact omits the a4-parent after_verified_clone receipt"
+  ],
+  "claimed_use_trace_holes": [
+    "a1/memory-on+evolve/seed1:fact:do-0006",
+    "a6/memory-on/seed1:fact:do-0002"
+  ],
+  "c0_digest_before": "d45721ecd79dab79237612c444bbac8069cf316cc03d02bb360a2486af79270e",
+  "c0_digest_after": "d45721ecd79dab79237612c444bbac8069cf316cc03d02bb360a2486af79270e",
+  "curator_after_task": "a4"
+}

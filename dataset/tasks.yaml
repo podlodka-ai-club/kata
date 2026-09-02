@@ -12,7 +12,7 @@ meta:
   # Удаляются в ОБОИХ режимах: в memory-off иначе сравниваем не с пустотой,
   # а с чужой памятью; в memory-on приехали бы две памяти сразу.
   strip_files: [AGENTS.md, CLAUDE.md]
-  repeats: 3
+  repeats: 2
 
 # ---------------------------------------------------------------------------
 # Про поле contract.
@@ -30,6 +30,7 @@ meta:
 tasks:
 
   - id: a1
+    transfer_cluster: data-repository-invariants
     solution_commit: d340fdd9d
     base_commit: 551a92a03
     date: 2026-05-10
@@ -42,6 +43,13 @@ tasks:
       - tests/unit_tests/repository_tests/test_search.py
       - tests/unit_tests/services_tests/backup_v2_tests/test_backup_v2.py
     slices: [data-ownership, invariants]
+    expected_facts: [fact:do-0005, fact:do-0006]
+    grading: {null_passed: 15, oracle_passed: 21}
+    architecture:
+      required_path_groups:
+        - ['^mealie/alembic/versions/']
+        - ['^mealie/db/models/', '^mealie/schema/response/query_search\.py$']
+      forbidden: []
     contract: null      # имена не пиняются, чистая проверка поведения
     hypothesis: >
       Правило нормализации живёт в одном месте и обязано быть зеркально повторено
@@ -49,6 +57,7 @@ tasks:
       значений. Без памяти агент правит одну сторону и забывает миграцию.
 
   - id: a2
+    transfer_cluster: config-api-auth
     solution_commit: 2d8b74282
     base_commit: 48752bcd0
     date: 2026-05-31
@@ -67,11 +76,21 @@ tasks:
       - tests/integration_tests/user_recipe_tests/test_recipe_image_assets.py
       - tests/unit_tests/test_config.py
     slices: [api-contracts, config-flags, invariants]
+    expected_facts: [fact:cf-0001, fact:cf-0005, fact:cf-0006]
+    grading: {null_passed: 41, oracle_passed: 44}
+    architecture:
+      required_path_groups:
+        - ['^mealie/core/settings/']
+        - ['^mealie/routes/media/']
+        - ['^frontend/app/lib/sanitize/', '^frontend/app/components/global/SafeMarkdown\.vue$']
+        - ['^docs/docs/documentation/getting-started/installation/backend-config\.md$']
+      forbidden: []
     hypothesis: >
       Конвенция репозитория: к новой настройке — тест в tests/unit_tests/test_config.py
       и строка в docs/.../backend-config.md. Оба шага забываются без памяти.
 
   - id: a3
+    transfer_cluster: data-repository-invariants
     solution_commit: bda2f3637
     base_commit: 95277e0e6
     date: 2026-07-17
@@ -83,6 +102,15 @@ tasks:
       - tests/integration_tests/category_tag_tool_tests/test_organizers_common.py
       - tests/integration_tests/user_household_tests/test_shopping_list_labels.py
     slices: [api-contracts, invariants]
+    expected_facts: [fact:ac-0004]
+    grading: {null_passed: 23, oracle_passed: 27}
+    architecture:
+      required_path_groups:
+        - ['^mealie/core/exceptions\.py$']
+        - ['^mealie/routes/_base/mixins\.py$']
+      forbidden:
+        - name: per-controller IntegrityError shortcut
+          path_regex: '^mealie/routes/(organizers|households)/'
     contract: null      # имена не пиняются
     hypothesis: >
       Самая чистая задача сета: два изменённых файла. Чтобы попасть, надо знать
@@ -90,6 +118,7 @@ tasks:
       централизованно в миксине, а не try/except в каждом контроллере.
 
   - id: a4
+    transfer_cluster: config-api-auth
     solution_commit: 29897e35e
     base_commit: 66afe5b4d
     date: 2026-08-09
@@ -106,12 +135,20 @@ tasks:
       - tests/integration_tests/user_tests/test_oidc_native.py
       - tests/utils/api_routes/__init__.py    # хелпер с константами маршрутов, без него тест не соберётся
     slices: [api-contracts, invariants]
+    expected_facts: [fact:ac-0001, fact:ac-0002, fact:iv-0001]
+    grading: {null_passed: 0, oracle_passed: 5}
+    architecture:
+      required_path_groups:
+        - ['^mealie/routes/auth/']
+        - ['^mealie/schema/user/']
+      forbidden: []
     hypothesis: >
       Ошибиться легко в инвариантах: какой код возврата на отклонённый код
       провайдера, что можно и чего нельзя отдавать наружу неаутентифицированному
       клиенту.
 
   - id: a5
+    transfer_cluster: config-api-auth
     solution_commit: feaa1c73a
     base_commit: 17951bb0f
     date: 2026-08-20
@@ -126,11 +163,19 @@ tasks:
     hidden_tests:
       - tests/integration_tests/admin_tests/test_admin_about.py
     slices: [api-contracts, config-flags]
+    expected_facts: [fact:cf-0001, fact:cf-0003, fact:cf-0004]
+    grading: {null_passed: 4, oracle_passed: 5}
+    architecture:
+      required_path_groups:
+        - ['^mealie/routes/admin/admin_about\.py$']
+        - ['^mealie/schema/admin/about\.py$']
+      forbidden: []
     hypothesis: >
       Новых настроек задача не вводит — флаги уже есть. Проверяется знание того,
       где живёт схема сводки и как в неё добавляются производные поля.
 
   - id: a6
+    transfer_cluster: data-repository-invariants
     solution_commit: e3cf55b93
     base_commit: 378a9b072
     date: 2026-08-25
@@ -144,6 +189,18 @@ tasks:
     hidden_tests:
       - tests/integration_tests/category_tag_tool_tests/test_organizers_merge.py
     slices: [data-ownership, api-contracts]
+    expected_facts: [fact:do-0001, fact:do-0002, fact:do-0003, fact:ac-0002]
+    grading: {null_passed: 0, oracle_passed: 9}
+    architecture:
+      required_path_groups:
+        - ['^mealie/db/models/recipe/(category|tag)\.py$']
+        - ['^mealie/repos/repository_factory\.py$']
+        - ['^mealie/routes/organizers/controller_(categories|tags)\.py$']
+        - ['^mealie/schema/recipe/']
+      forbidden:
+        - name: unscoped repository construction
+          path_regex: '^$'
+          diff_regex: 'AllRepositories\(\s*\)'
     hypothesis: >
       Семь файлов через все слои, включая фабрику репозиториев. Нужно знать
       конвенцию контроллеров и то, как репозитории скоупятся по группе и household.
