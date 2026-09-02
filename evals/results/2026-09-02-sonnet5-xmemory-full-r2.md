@@ -120,3 +120,5 @@ Agent wall-clock не используется для межрежимного �
 
 Полные компактные числовые строки без agent prose и локальных путей: [CSV](2026-09-02-sonnet5-xmemory-full-r2.csv).
 Инциденты и изменения инфраструктуры: [отдельный журнал](2026-09-02-sonnet5-xmemory-full-r2-problems.md).
+Проверяемая граница текущего знания и план следующего эксперимента:
+[current learnings](2026-09-02-sonnet5-xmemory-current-learnings.md).
