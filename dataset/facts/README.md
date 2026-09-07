@@ -12,6 +12,10 @@ SessionStart-хук вернёт ошибку, раннер пометит пр�
 в сравнительную сводку. Прогон, в который память не приехала, — это `memory-off` под другим
 именем, а не экспериментальная точка.
 
-Читаем из файла, а не из xmemory на каждой сессии: 36 прогонов этапа 1 — это десятки
-живых чтений, а квоты у нас впритык. Для демо и для этапа 2 есть режим
-`[memory].mode = "xmemcli"`, который ходит в память по-настоящему.
+`snapshot-c0.md` является воспроизводимым seed/export, а не runtime memory и не одинаковым
+контекстом каждой задачи. Provisioning один раз превращает его в read-only C0 template с typed
+objects/relations. Затем xmemory backend перед каждой coding/curator-сессией создаёт fresh child
+из предыдущего cloud instance, делает scoped/top-k read и structured write. Между сессиями нет
+локального fact-state: `lineage.json` содержит только remote IDs/hashes. File backend используется
+только бесплатными selftests. Старый режим, где Markdown передавался целиком и read-only, сохранён
+только в архивном baseline как **naive full-snapshot negative control**.

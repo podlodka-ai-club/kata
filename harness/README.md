@@ -1,34 +1,39 @@
 # Каркас прогонов и метрики
 
-> Заготовка. Владелец — **Олег**. Всё ниже — договорённость с созвона 28.08, уточняется по ходу.
+Исполняемый harness находится в [`dataset/runner/`](../dataset/runner/). Он сравнивает три режима:
+`memory-off`, последовательный read/write `memory-on` и `memory-on+evolve` с отдельной
+curator-session после a3. Code workspace каждой задачи одноразовый; memory state хронологический,
+durable и изолирован по mode/seed.
 
-> **Этап 1 — сравниваем `memory-off` и `memory-on`, и всё.** Это основная гипотеза, до дедлайна
-> нужна именно эта пара с метриками. `memory-on+evolve` — этап 2, за него берёмся только когда
-> этап 1 отработан end-to-end: иначе в эксперименте две переменные сразу и непонятно, что дало
-> эффект — память или её эволюция.
-> См. [«Порядок работ»](../README.md#порядок-работ-сначала-off-vs-on-самоулучшение--потом).
+## Оси измерения
 
-Что здесь должно появиться:
+| Ось | Поля |
+| --- | --- |
+| Primary quality | `feature_lift`, feature-dependent passed/total, macro-average по задачам |
+| Secondary quality | micro hidden passed/total, binary `task_success` |
+| Validity | `valid_run` отдельно от `analytical_eligible` и причин исключения |
+| Pristine tests | added tests отдельно от modified/deleted existing; regression/hidden после restore base tests |
+| Retrieval | exact fact IDs/content, count/chars/tokens, expected precision/coverage, irrelevant facts |
+| Memory | create/update/stale/noop, gotchas, used/produced facts, state/schema versions |
+| Architecture | predeclared required layers и forbidden shortcuts, отдельно от hidden behavior |
+| Process/cost | coding/read/write/evolve wall и usage отдельно, turns, files changed |
+| Attribution/harm | fact→read→Task link→diff/check; on хуже off, stale used, post-retrieval regression |
 
-1. **Запуск раннера** [`../dataset/runner/`](../dataset/) в режимах:
-   - `memory-off` — агент + задача;
-   - `memory-on` — агент + задача + факты из xmemory (хуки чтения/записи);
-   - `memory-on+evolve` — **этап 2, не сейчас**: то же плюс промежуточная сессия самоулучшения
-     памяти (дедупликация фактов, правка схемы, пометка устаревшего).
-2. **Сбор метрик** прогонов и сведение в сравнимую таблицу.
-3. **Изоляция** прогонов: свой одноразовый однокоммитный workspace на каждый прогон, на базовом коммите задачи (не на общем `C0` — см. [`../dataset/repo.md`](../dataset/repo.md#реперная-точка-c0-и-раскладка-прогонов)), чередование порядка
-   режимов, повтор ключевых задач ×3 — один запуск недетерминированной модели ничего не доказывает.
+Primary score на задаче:
 
-## Метрики
+```text
+feature_lift = (agent_passed - null_passed) / (oracle_passed - null_passed)
+```
 
-| Ось | Метрика | Как считаем |
-| --- | --- | --- |
-| Цена | токены, стоимость, wall-clock, число тул-колов и итераций | из логов прогона |
-| Механика | сборка, штатные тесты репозитория | автоматически |
-| Архитектура | скрытые архитектурные проверки | чеклист по эталону, см. [../evals/README.md](../evals/README.md) |
-| Память | какие факты уехали в контекст, какие мутации ушли, attribution «факт → пройденная проверка» | логи раннера + связи `Task → Fact` в xmemory |
+При неположительном gap значение аналитически не определено. Отрицательные значения сохраняются
+как harmful signal. В summary сначала считается macro-average по eligible задачам каждого seed,
+затем median/range по трём repeats; один seed не интерпретируется каузально.
 
-## Требование к среде
+## Research gate
 
-Любой из нас должен уметь запустить прогон и пожечь свои токены claude/codex — конфигурация
-провайдера и лимитов вынесена наружу, а не зашита в скрипт.
+1. Бесплатно: fake-backend state machine и полный null/oracle selftest.
+2. Canary: только `a3→a6`, один seed, три режима.
+3. Только при зелёном canary: `a1→a2→a3→evolve→a4→a5→a6`, три repeats.
+
+Точные команды, backend setup и список артефактов — в
+[`dataset/runner/README.md`](../dataset/runner/README.md).

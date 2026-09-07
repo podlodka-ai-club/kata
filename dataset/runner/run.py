@@ -9,8 +9,8 @@
   2. материализует base_commit в свежий однокоммитный git repo без будущей истории;
   3. убирает чужие агентские файлы (AGENTS.md / CLAUDE.md) — в ОБОИХ режимах,
      иначе в memory-off приезжает чужая память, а в memory-on — две сразу;
-  4. в memory-on кладёт .claude/settings.json с хуками и проверяет, что память
-     реально уехала в контекст (пустой снапшот = прогон невалиден, не тихий ноль);
+  4. в memory modes читает scoped active facts из изолированного durable backend,
+     инжектит exact context и применяет validated write-back после новой сессии;
   5. запускает агента;
   6. снимает дифф, гоняет регрессию (скрытые тесты из неё исключены);
   7. накладывает скрытые тесты из эталонного коммита и гоняет их;
@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -35,7 +36,14 @@ import time
 import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from memory_backend import MemoryError as BackendMemoryError, open_backend
+from test_protection import (ADDED_TESTS_DIR, TestProtectionError,
+                             build_manifest as build_test_manifest,
+                             protect as protect_tests, restore_modes as unprotect_tests,
+                             verify as verify_pristine_tests,
+                             verify_protected as verify_protected_tests)
 
 try:
     import yaml
@@ -49,6 +57,10 @@ ROOT = Path(__file__).resolve().parents[2]
 HOOKS_DIR = ROOT / "dataset" / "hooks"
 
 RC_TIMEOUT = -9
+TOOLING_LESSON_RE = re.compile(
+    r"\b(pytest|sandbox|tool(?:ing)?|permission|uv cache|cli|hook|timeout|workspace)\b",
+    re.IGNORECASE,
+)
 
 
 # --------------------------------------------------------------------------- утилиты
@@ -143,6 +155,10 @@ class Task:
     hidden_tests: list[str]
     slices: list[str] = field(default_factory=list)
     contract: str | None = None
+    expected_facts: list[str] = field(default_factory=list)
+    grading: dict = field(default_factory=dict)
+    architecture: dict = field(default_factory=dict)
+    transfer_cluster: str | None = None
 
 
 def load_tasks(path: Path) -> tuple[dict, dict[str, Task]]:
@@ -157,6 +173,10 @@ def load_tasks(path: Path) -> tuple[dict, dict[str, Task]]:
             hidden_tests=t["hidden_tests"],
             slices=t.get("slices", []),
             contract=(" ".join(t["contract"].split()) if t.get("contract") else None),
+            expected_facts=t.get("expected_facts", []),
+            grading=t.get("grading", {}) or {},
+            architecture=t.get("architecture", {}) or {},
+            transfer_cluster=t.get("transfer_cluster"),
         )
         for t in doc.get("tasks", [])
     }
@@ -193,7 +213,7 @@ def ensure_clone(cfg) -> Path:
         clone.parent.mkdir(parents=True, exist_ok=True)
         print(f"[workspace] клонирую {cfg['repo']['url']} -> {clone}")
         sh(["git", "clone", cfg["repo"]["url"], str(clone)], check=True)
-    else:
+    elif cfg["repo"].get("fetch", True):
         sh(["git", "fetch", "--quiet", "--all"], cwd=clone, check=True)
     return clone
 
@@ -250,8 +270,8 @@ def strip_foreign_memory(wt: Path, names: list[str]) -> list[str]:
 
 def install_agent_settings(wt: Path, memory_on: bool, write_back: bool) -> None:
     """
-    В обоих режимах ставит одинаковую OS-песочницу. В memory-on дополнительно
-    ставит SessionStart, который читает локальную копию снапшота.
+    Во всех режимах ставит одинаковую OS-песочницу. В memory modes дополнительно
+    ставит SessionStart для prepared task context и Stop для write-back.
 
     Stop-хук (шаг актуализации памяти) ставим ТОЛЬКО когда памяти реально есть
     куда писать. Иначе он гарантированно добавляет memory-on лишний ход и лишние
@@ -262,13 +282,35 @@ def install_agent_settings(wt: Path, memory_on: bool, write_back: bool) -> None:
         settings = json.loads((HOOKS_DIR / "settings.memory-on.json").read_text(encoding="utf-8"))
         if not write_back:
             settings["hooks"].pop("Stop", None)
+    settings.setdefault("hooks", {})["PreToolUse"] = [{
+        "matcher": "Edit|Write",
+        "hooks": [{
+            "type": "command",
+            "command": "python3 \"$KATA_HOOKS_DIR/pre_tool_use.py\"",
+            "timeout": 10,
+        }],
+    }]
+    settings["permissions"] = {"deny": [
+        "Edit(/tests/**)", "Edit(/.claude/**)", "Edit(/.kata-hooks/**)",
+        "Edit(/.kata-bin/**)", "Edit(/.git/**)",
+    ]}
     settings["sandbox"] = {
         "enabled": True,
         "failIfUnavailable": True,
         "allowUnsandboxedCommands": False,
         # Reference clone, dataset and credentials live under home; subprocesses
         # may read only the temporary project workspace.
-        "filesystem": {"denyRead": ["~/"], "allowRead": ["."]},
+        "filesystem": {
+            "denyRead": ["~/"], "allowRead": ["."],
+            # Base tests are also protected by readonly modes + immutable flags.
+            # This sandbox boundary is defense in depth and leaves one explicit
+            # directory where the agent may add new tests.
+            "denyWrite": [
+                str((wt / "tests").resolve()), str((wt / ".claude").resolve()),
+                str((wt / ".kata-hooks").resolve()), str((wt / ".kata-bin").resolve()),
+                str((wt / ".git").resolve()),
+            ],
+        },
     }
     claude_dir = wt / ".claude"
     claude_dir.mkdir(exist_ok=True)
@@ -276,7 +318,9 @@ def install_agent_settings(wt: Path, memory_on: bool, write_back: bool) -> None:
         json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def install_agent_runtime(wt: Path, cfg, memory_on: bool) -> dict[str, str]:
+def install_agent_runtime(wt: Path, cfg, memory_on: bool,
+                          prepared_context: str | None = None,
+                          existing_fact_ids: list[str] | None = None) -> dict[str, str]:
     """Копирует минимальный runtime внутрь sandbox и возвращает его env."""
     bin_dir = wt / ".kata-bin"
     bin_dir.mkdir(exist_ok=True)
@@ -290,18 +334,26 @@ def install_agent_runtime(wt: Path, cfg, memory_on: bool) -> dict[str, str]:
         "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         "UV_CACHE_DIR": str(wt / ".uv-cache"),
     }
+    local_hooks = wt / ".kata-hooks"
+    shutil.copytree(HOOKS_DIR, local_hooks)
+    env["KATA_HOOKS_DIR"] = str(local_hooks)
+    env["KATA_WORKSPACE_ROOT"] = str(wt)
     if memory_on:
-        local_hooks = wt / ".kata-hooks"
-        shutil.copytree(HOOKS_DIR, local_hooks)
-        env["KATA_HOOKS_DIR"] = str(local_hooks)
         env["KATA_RUN_DIR"] = str(wt / ".kata-run")
-        env["KATA_MEMORY_MODE"] = cfg["memory"]["mode"]
-        if cfg["memory"]["mode"] == "snapshot":
+        env["KATA_MEMORY_MODE"] = "prepared"
+        id_registry = local_hooks / "existing-fact-ids.json"
+        id_registry.write_text(json.dumps(sorted(existing_fact_ids or [])), encoding="utf-8")
+        env["KATA_EXISTING_FACT_IDS"] = str(id_registry)
+        if prepared_context is not None:
+            local_context = local_hooks / "task-context.json"
+            local_context.write_text(prepared_context, encoding="utf-8")
+            env["KATA_FACTS_CONTEXT"] = str(local_context)
+        elif cfg["memory"].get("retrieval") == "naive-dump":
+            env["KATA_MEMORY_MODE"] = "snapshot-naive"
             snapshot = (ROOT / cfg["memory"]["snapshot"]).resolve()
             local_snapshot = local_hooks / "snapshot-c0.md"
             shutil.copy2(snapshot, local_snapshot)
             env["KATA_FACTS_SNAPSHOT"] = str(local_snapshot)
-        env["KATA_XMEM_INSTANCE"] = cfg["memory"].get("xmem_instance", "")
     return env
 
 
@@ -328,7 +380,9 @@ def build_prompt(task: Task) -> str:
     if task.contract:
         parts.append(f"Публичный контракт, которого нужно придерживаться: {task.contract}")
     parts.append("Работай в этом репозитории. Реализуй изменение так, как это принято "
-                 "в проекте. Когда закончишь — коротко перечисли, что изменил.")
+                 "в проекте. Существующие tests физически защищены: не пытайся менять, "
+                 "удалять или переименовывать их. Если нужны новые tests, добавляй их только "
+                 f"в {ADDED_TESTS_DIR.as_posix()}/. Когда закончишь — коротко перечисли, что изменил.")
     return "\n\n".join(parts)
 
 
@@ -343,6 +397,37 @@ def changed_sources(clone: Path, task: Task) -> list[str]:
     if rc != 0:
         return []
     return [f for f in out.splitlines() if f.strip() and not f.startswith("tests/")]
+
+
+def effective_agent_cmd(template: list[str], prompt: str, model: str, effort: str,
+                        write_back: bool) -> list[str]:
+    cmd = [part.replace("{prompt}", prompt).replace("{model}", model).replace(
+        "{effort}", effort) for part in template]
+    if write_back and "--allowedTools" in cmd:
+        allowed_index = cmd.index("--allowedTools") + 1
+        rules = [rule for rule in cmd[allowed_index].split(",")
+                 if not rule.startswith("Write(") and rule != "Write"]
+        rules.append("Write")
+        cmd[allowed_index] = ",".join(rules)
+    return cmd
+
+
+def transient_agent_error(stdout: str) -> bool:
+    """Recognize only explicit provider/network failures, never model task failures."""
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return False
+    if not payload.get("is_error"):
+        return False
+    result = str(payload.get("result", "")).lower()
+    return any(marker in result for marker in (
+        "connection closed mid-response",
+        "connection reset",
+        "request timed out",
+        "api error: overloaded",
+        "api error: service unavailable",
+    ))
 
 
 def run_agent(kind: str, cfg, wt: Path, task: Task, clone: Path,
@@ -386,32 +471,65 @@ def run_agent(kind: str, cfg, wt: Path, task: Task, clone: Path,
         return {"kind": kind, "rc": 2, "wall_sec": time.time() - t0,
                 "usage": {}, "usage_parsed": False,
                 "error": "agent.effort должен быть low/medium/high/xhigh/max"}
-    cmd = [c.replace("{prompt}", prompt).replace("{model}", model).replace("{effort}", effort)
-           for c in cfg["agent"]["cmd"]]
+    cmd = effective_agent_cmd(cfg["agent"]["cmd"], prompt, model, effort,
+                              bool(env_extra.get("KATA_RUN_DIR")))
+    # Claude may normalize a workspace-relative Write target to an absolute temporary
+    # path before permission matching. A selector such as Write(./**) then rejects the
+    # Stop-hook's required `.kata-run/memory_mutations.json`. The OS sandbox still limits
+    # all writes to this disposable workspace, so grant the Write tool itself whenever
+    # write-back is active instead of relying on path-string spelling.
     _, cli_version, _ = sh([cmd[0], "--version"], cwd=wt, env=env_extra, timeout=30)
-    rc, out, err = sh(cmd, cwd=wt, env=env_extra, timeout=cfg["agent"].get("timeout_sec", 3600))
+    max_attempts = 1 + max(0, int(cfg["agent"].get("transient_retries", 1)))
+    attempts = []
+    timeout = cfg["agent"].get("timeout_sec", 3600)
+    for attempt in range(1, max_attempts + 1):
+        rc, out, err = sh(cmd, cwd=wt, env=env_extra, timeout=timeout)
+        attempts.append({"attempt": attempt, "rc": rc, "stdout": out, "stderr": err})
+        if not transient_agent_error(out) or attempt == max_attempts:
+            break
+        interim = capture_diff(wt, run_dir, exclude=cfg["repo"].get("strip_files", []))
+        if interim["files_changed"]:
+            print("[agent] transient provider error after source changes; refusing unsafe retry",
+                  file=sys.stderr)
+            break
+        print(f"[agent] transient provider error with empty diff; retry {attempt + 1}/{max_attempts}",
+              file=sys.stderr)
+
+    if len(attempts) > 1:
+        for item in attempts:
+            prefix = f"agent_attempt{item['attempt']}"
+            (run_dir / f"{prefix}_stdout.log").write_text(item["stdout"], encoding="utf-8")
+            (run_dir / f"{prefix}_stderr.log").write_text(item["stderr"], encoding="utf-8")
     (run_dir / "agent_stdout.log").write_text(out, encoding="utf-8")
     (run_dir / "agent_stderr.log").write_text(err, encoding="utf-8")
 
-    usage, parsed = {}, False
-    try:  # claude -p --output-format json отдаёт usage и стоимость
-        payload = json.loads(out)
-        u = payload.get("usage", {})
-        usage = {
-            "input_tokens": u.get("input_tokens"),
-            "output_tokens": u.get("output_tokens"),
-            "cache_read_tokens": u.get("cache_read_input_tokens"),
-            "cache_creation_tokens": u.get("cache_creation_input_tokens"),
-            "total_cost_usd": payload.get("total_cost_usd"),
-            "num_turns": payload.get("num_turns"),
-        }
-        parsed = True
-    except Exception as e:
-        print(f"[usage] не разобрал вывод агента как JSON ({e}); ценовая ось будет пустой",
-              file=sys.stderr)
+    usage = {key: 0 for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                                 "cache_creation_tokens", "total_cost_usd", "num_turns")}
+    parsed = True
+    for item in attempts:
+        try:  # claude -p --output-format json отдаёт usage и стоимость
+            payload = json.loads(item["stdout"])
+            u = payload.get("usage", {})
+            values = {
+                "input_tokens": u.get("input_tokens"),
+                "output_tokens": u.get("output_tokens"),
+                "cache_read_tokens": u.get("cache_read_input_tokens"),
+                "cache_creation_tokens": u.get("cache_creation_input_tokens"),
+                "total_cost_usd": payload.get("total_cost_usd"),
+                "num_turns": payload.get("num_turns"),
+            }
+            for key, value in values.items():
+                if value is not None:
+                    usage[key] += value
+        except Exception as e:
+            parsed = False
+            print(f"[usage] не разобрал attempt {item['attempt']} как JSON ({e}); "
+                  "ценовая ось будет неполной", file=sys.stderr)
 
     return {"kind": kind, "rc": rc, "wall_sec": time.time() - t0,
             "model": model, "effort": effort, "cli_version": cli_version.strip(),
+            "cmd": cmd, "attempts": len(attempts),
+            "transient_retries": len(attempts) - 1,
             "usage": usage, "usage_parsed": parsed}
 
 
@@ -433,15 +551,198 @@ def capture_diff(wt: Path, run_dir: Path, exclude: list[str] | None = None) -> d
     _, diff, _ = sh(["git", "diff", "--cached"], cwd=wt)
     (run_dir / "diff.patch").write_text(diff, encoding="utf-8")
     _, stat, _ = sh(["git", "diff", "--cached", "--numstat"], cwd=wt)
-    rows = [l.split("\t") for l in stat.splitlines() if l.strip()]
+    rows = [line.split("\t") for line in stat.splitlines() if line.strip()]
     touched = [r[2] for r in rows if len(r) == 3]
+    _, status, _ = sh(["git", "diff", "--cached", "--name-status"], cwd=wt)
+    test_changes = {"added": [], "modified_existing": [], "deleted_existing": []}
+    for line in status.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or not (parts[-1].startswith("tests/")
+                                  or parts[-1].startswith(f"{ADDED_TESTS_DIR.as_posix()}/")):
+            continue
+        code, path = parts[0][0], parts[-1]
+        if path.startswith(f"{ADDED_TESTS_DIR.as_posix()}/") and code != "A":
+            test_changes["modified_existing"].append(path)
+        elif code == "A":
+            test_changes["added"].append(path)
+        elif code == "D":
+            test_changes["deleted_existing"].append(path)
+        else:
+            test_changes["modified_existing"].append(path)
     return {
         "files_changed": len(touched),
         "touched": touched[:60],
-        "agent_touched_tests": any(p.startswith("tests/") for p in touched),
+        "agent_touched_tests": any(p.startswith("tests/")
+                                   or p.startswith(f"{ADDED_TESTS_DIR.as_posix()}/")
+                                   for p in touched),
+        "test_changes": test_changes,
+        "agent_changed_existing_tests": bool(test_changes["modified_existing"]
+                                             or test_changes["deleted_existing"]),
         "insertions": sum(int(r[0]) for r in rows if r[0].isdigit()),
         "deletions": sum(int(r[1]) for r in rows if r[1].isdigit()),
     }
+
+
+def snapshot_pristine_tests(wt: Path) -> Path:
+    """Keep base tests outside the agent workspace, then restore them for grading."""
+    root = Path(tempfile.mkdtemp(prefix="kata-pristine-tests-"))
+    source = wt / "tests"
+    if source.exists():
+        shutil.copytree(source, root / "tests")
+    return root
+
+
+def restore_pristine_tests(wt: Path, pristine: Path) -> None:
+    target = wt / "tests"
+    if target.exists():
+        shutil.rmtree(target)
+    source = pristine / "tests"
+    if source.exists():
+        shutil.copytree(source, target)
+
+
+def feature_lift(agent_passed: int, null_passed: int | None,
+                 oracle_passed: int | None) -> tuple[float | None, str | None]:
+    """Normalized feature lift; negative harm and >1 over-oracle values stay observable."""
+    if null_passed is None or oracle_passed is None:
+        return None, "missing_null_or_oracle"
+    denominator = oracle_passed - null_passed
+    if denominator <= 0:
+        return None, "non_positive_oracle_gap"
+    return round((agent_passed - null_passed) / denominator, 6), None
+
+
+def architecture_grade(task: Task, touched: list[str], diff_text: str) -> dict:
+    """Deterministic, predeclared placement checks; prompts never expose these rules."""
+    groups = task.architecture.get("required_path_groups", [])
+    required = []
+    for group in groups:
+        matched = sorted({p for p in touched if any(re.search(pattern, p) for pattern in group)})
+        required.append({"patterns": group, "passed": bool(matched), "matched": matched})
+    forbidden = []
+    for rule in task.architecture.get("forbidden", []):
+        path_hits = sorted({p for p in touched if re.search(rule.get("path_regex", r"$^"), p)})
+        diff_hit = bool(rule.get("diff_regex") and re.search(rule["diff_regex"], diff_text, re.M))
+        forbidden.append({"name": rule.get("name", "forbidden shortcut"),
+                          "passed": not path_hits and not diff_hit,
+                          "path_hits": path_hits, "diff_hit": diff_hit})
+    checks = [r["passed"] for r in required] + [r["passed"] for r in forbidden]
+    return {"required": required, "forbidden": forbidden,
+            "passed": sum(checks), "total": len(checks),
+            "green": bool(checks) and all(checks),
+            "score": round(sum(checks) / len(checks), 3) if checks else None,
+            "judge": task.architecture.get("judge", "deterministic")}
+
+
+def prepare_precision_batch(batch: dict, task: Task, touched: list[str],
+                            quality_confirmed: bool, c0_fact_ids: set[str],
+                            precision_profile: bool) -> tuple[dict, dict]:
+    """Keep C0 immutable and promote only checked product-architecture lessons."""
+    normalized = json.loads(json.dumps(batch))
+    promotions = []
+    hidden_markers = {task.solution_commit, *task.hidden_tests,
+                      *(Path(path).name for path in task.hidden_tests)}
+    for item in normalized.get("mutations", []):
+        op = item.get("op")
+        fact_id = item.get("fact_id") or (item.get("fact") or {}).get("fact_id")
+        if precision_profile and op in {"update", "stale"} and fact_id in c0_fact_ids:
+            raise BackendMemoryError(f"precision protocol keeps C0 fact immutable: {fact_id}")
+        if op != "create":
+            continue
+        fact = item.get("fact") or {}
+        rendered = f"{fact.get('statement', '')}\n{fact.get('content', '')}"
+        if any(marker and marker in rendered for marker in hidden_markers):
+            raise BackendMemoryError(f"future/hidden-test marker leaked into learned fact {fact_id}")
+        evidence = [ref for ref in fact.get("evidence", []) if isinstance(ref, str)]
+        product_architecture = fact.get("slice") != "gotchas" and not TOOLING_LESSON_RE.search(rendered)
+        touched_product_paths = {
+            path for path in touched
+            if path and not path.startswith(("tests/", f"{ADDED_TESTS_DIR}/", ".kata-"))
+        }
+        evidence_in_diff = any(
+            _normalized_evidence_path(ref) in touched_product_paths for ref in evidence)
+        confirmed = bool(precision_profile and quality_confirmed
+                         and product_architecture and evidence_in_diff)
+        cluster = task.transfer_cluster or "unclustered"
+        if precision_profile:
+            fact["status"] = "active" if confirmed else "candidate"
+            fact["confidence"] = "high" if confirmed else fact.get("confidence", "low")
+            fact["provenance"] = "observed" if confirmed else fact.get("provenance", "inferred")
+            tier = "task-validated" if confirmed else "task-unvalidated"
+            fact["source"] = f"{tier}:{task.id}:{cluster}"
+        promotions.append({
+            "fact_id": fact_id, "confirmed_for_transfer": confirmed,
+            "product_architecture": product_architecture,
+            "evidence_in_diff": evidence_in_diff,
+            "quality_confirmed": quality_confirmed,
+            "resulting_status": fact.get("status"), "resulting_source": fact.get("source"),
+        })
+    return normalized, {"precision_profile": precision_profile, "facts": promotions}
+
+
+def _normalized_evidence_path(reference: str) -> str | None:
+    """Return a safe repo-relative evidence path, stripping only a numeric line suffix."""
+    raw = reference.strip().strip("`").replace("\\", "/")
+    match = re.fullmatch(r"(.+?):\d+(?:-\d+)?", raw)
+    if not match:
+        return None
+    path = PurePosixPath(match.group(1))
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        return None
+    normalized = str(path)
+    if normalized.startswith(("tests/", f"{ADDED_TESTS_DIR}/", ".kata-")):
+        return None
+    return normalized
+
+
+def retrieval_leakage_check(task: Task, all_tasks: dict[str, Task],
+                            facts: list[dict], selection: dict | None) -> dict:
+    """Reject future task/solution/hidden markers before coding tokens are spent."""
+    order = list(all_tasks)
+    current_index = order.index(task.id)
+    selected = {item["fact_id"]: item for item in (selection or {}).get("selected", [])}
+    forbidden = []
+    for candidate in all_tasks.values():
+        forbidden.append((f"solution_commit:{candidate.id}", candidate.solution_commit))
+        forbidden.extend((f"hidden_path:{candidate.id}", path) for path in candidate.hidden_tests)
+    violations = []
+    for fact in facts:
+        fact_id = fact["fact_id"]
+        rendered = json.dumps(fact, sort_keys=True, ensure_ascii=False)
+        meta = selected.get(fact_id, {})
+        for label, marker in forbidden:
+            if marker and marker in rendered:
+                violations.append({"fact_id": fact_id, "reason": label})
+        if meta.get("origin") == "c0" and fact_id not in set(task.expected_facts):
+            violations.append({"fact_id": fact_id, "reason": "unexpected_c0_fact"})
+        if meta.get("origin") == "learned":
+            parts = str(fact.get("source", "")).split(":", 2)
+            source_task = parts[1] if len(parts) == 3 else ""
+            if source_task not in order or order.index(source_task) >= current_index:
+                violations.append({"fact_id": fact_id,
+                                   "reason": "learned_fact_not_from_prior_task"})
+    return {"ok": not violations, "violations": violations,
+            "checked_fact_ids": [fact["fact_id"] for fact in facts]}
+
+
+def analytical_eligibility(valid_run: bool, regression: dict, diff: dict,
+                           memory_required: bool, memory_read_ok: bool,
+                           memory_write_ok: bool,
+                           pristine_tests_ok: bool = True) -> tuple[bool, list[str]]:
+    reasons = []
+    if not valid_run:
+        reasons.append("technical_invalid")
+    if not regression.get("green"):
+        reasons.append("regression_red")
+    if diff.get("agent_changed_existing_tests"):
+        reasons.append("existing_tests_modified_or_deleted")
+    if not pristine_tests_ok:
+        reasons.append("base_tests_not_pristine")
+    if memory_required and not memory_read_ok:
+        reasons.append("memory_read_invalid")
+    if memory_required and not memory_write_ok:
+        reasons.append("memory_write_invalid")
+    return not reasons, reasons
 
 
 def run_tests(wt: Path, cfg, targets: list[str], run_dir: Path, label: str,
@@ -469,22 +770,39 @@ def main() -> int:
     ap.add_argument("--config", default="dataset/runner/config.toml")
     ap.add_argument("--tasks", default="dataset/tasks.yaml")
     ap.add_argument("--task", required=True)
-    ap.add_argument("--mode", choices=["memory-off", "memory-on"], required=True)
+    ap.add_argument("--mode", choices=["memory-off", "memory-on", "memory-on+evolve"], required=True)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--agent", default=None, help="claude | codex | null | oracle")
     ap.add_argument("--out", default="runs")
     ap.add_argument("--skip-setup", action="store_true")
     ap.add_argument("--keep-worktree", action="store_true",
                     help="не удалять рабочее дерево после прогона (для разбора)")
+    ap.add_argument("--memory-state", default=None,
+                    help="durable state directory for this chronological mode/seed stream")
+    ap.add_argument("--reset-memory", action="store_true",
+                    help="re-clone this stream from frozen C0 before the task")
     args = ap.parse_args()
 
     cfg = tomllib.loads((ROOT / args.config).read_text(encoding="utf-8"))
+    experiment_id = cfg.get("experiment", {}).get("id", "legacy-unspecified")
+    protocol_mode = ({
+        "memory-off": "memory-off",
+        "memory-on": "precision-memory-on",
+        "memory-on+evolve": "precision-memory-on+evolve",
+    }[args.mode] if cfg.get("memory", {}).get("retrieval_profile") == "precision-v1"
+        else args.mode)
     meta, tasks = load_tasks(ROOT / args.tasks)
     if args.task not in tasks:
         sys.exit(f"нет задачи {args.task}; есть: {', '.join(tasks)}")
     task = tasks[args.task]
     kind = args.agent or cfg["agent"]["kind"]
-    write_back = bool(cfg.get("memory", {}).get("write_back", False))
+    memory_on = args.mode != "memory-off"
+    write_back = memory_on and bool(cfg.get("memory", {}).get("write_back", True))
+    if (memory_on and cfg.get("memory", {}).get("require_xmemory_for_memory_modes", True)
+            and cfg.get("memory", {}).get("backend") != "xmemory"):
+        print("[memory] official memory modes require backend=xmemory; "
+              "file is selftest-only", file=sys.stderr)
+        return 3
 
     run_dir = ROOT / args.out / task.id / args.mode / f"seed{args.seed}"
     if run_dir.exists():
@@ -500,6 +818,53 @@ def main() -> int:
         print("[валидация] задача не готова к прогону, токены не тратим", file=sys.stderr)
         return 3
 
+    memory_backend = None
+    memory_read = None
+    memory_read_ok = not memory_on
+    memory_write = None
+    memory_batch = None
+    memory_promotion = None
+    leakage_check = {"ok": True, "violations": [], "checked_fact_ids": []}
+    memory_write_ok = not memory_on
+    if memory_on:
+        snapshot = (ROOT / cfg["memory"]["snapshot"]).resolve()
+        state_dir = ((ROOT / args.memory_state).resolve() if args.memory_state else
+                     (ROOT / args.out / "_memory" / args.mode / f"seed{args.seed}").resolve())
+        try:
+            memory_backend = open_backend(cfg, state_dir, snapshot, args.mode, args.seed,
+                                          session_id=task.id)
+            memory_backend.prepare(reset=args.reset_memory)
+            memory_read = memory_backend.read(task.id, task.slices,
+                                              f"{task.title}\n{task.prompt}",
+                                              int(cfg["memory"].get("top_k", 20)),
+                                              expected_fact_ids=task.expected_facts,
+                                              transfer_cluster=task.transfer_cluster,
+                                              relevance_threshold=float(
+                                                  cfg["memory"].get("relevance_threshold", 0.75)),
+                                              learned_top_k=int(
+                                                  cfg["memory"].get("learned_top_k", 1)))
+            memory_read_ok = bool(memory_read.facts and memory_read.exact_text.strip())
+            leakage_check = retrieval_leakage_check(
+                task, tasks, memory_read.facts, memory_read.metrics.get("selection"))
+            (run_dir / "memory_read.json").write_text(
+                json.dumps(memory_read.metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+            (run_dir / "retrieval_leakage_check.json").write_text(
+                json.dumps(leakage_check, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+        except BackendMemoryError as exc:
+            print(f"[память] read/prepare failed: {exc}", file=sys.stderr)
+            print("[память] preflight failed; coding tokens are not spent", file=sys.stderr)
+            return 3
+        if not memory_read_ok:
+            print("[память] scoped retrieval returned no auditable active facts; "
+                  "coding tokens are not spent", file=sys.stderr)
+            return 3
+        if not leakage_check.get("ok"):
+            print(f"[память] retrieval leakage guard failed: {leakage_check['violations']}",
+                  file=sys.stderr)
+            print("[память] coding tokens are not spent", file=sys.stderr)
+            return 3
+
     workspace_root = Path(tempfile.gettempdir()) / "kata-eval-workspaces"
     wt, removed = make_workspace(
         clone,
@@ -507,10 +872,16 @@ def main() -> int:
         workspace_root / f"{task.id}-{args.mode}-{args.seed}",
         cfg["repo"].get("strip_files", []),
     )
+    pristine = snapshot_pristine_tests(wt)
+    test_manifest = build_test_manifest(wt)
+    (run_dir / "base_tests_manifest.json").write_text(
+        json.dumps(test_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    protection_active = False
+    pristine_proof = {"ok": False, "hash_mode_equal": False, "mismatches": []}
     try:
         print(f"[workspace] {task.id} @ {task.base_commit}, убрано: {removed or '—'}")
 
-        install_agent_settings(wt, args.mode == "memory-on", write_back)
+        install_agent_settings(wt, memory_on, write_back)
 
         if not args.skip_setup:
             rc, out, err = sh(cfg["repo"]["setup_cmd"], cwd=wt,
@@ -522,17 +893,49 @@ def main() -> int:
 
         # Runtime копируется в workspace: subprocess sandbox не получает доступ
         # к reference clone, датасету и снапшоту на хосте.
-        env_extra = install_agent_runtime(wt, cfg, args.mode == "memory-on")
-        if args.mode == "memory-on":
+        env_extra = install_agent_runtime(
+            wt, cfg, memory_on, memory_read.exact_text if memory_read else None,
+            (memory_read.metrics.get("existing_fact_ids", []) if memory_read else []))
+        env_extra["PYTHONDONTWRITEBYTECODE"] = "1"
+        if memory_on:
             env_extra.update({
                 "KATA_TASK_ID": task.id,
                 "KATA_SEED": str(args.seed),
             })
 
+        try:
+            # Setup is trusted runner work, but it still must not have changed base tests.
+            verify_pristine_tests(wt, test_manifest)
+            protection = protect_tests(wt, test_manifest)
+            protection_active = True
+            (run_dir / "test_protection.json").write_text(
+                json.dumps(protection, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except TestProtectionError as exc:
+            print(f"[tests] physical protection preflight failed: {exc}", file=sys.stderr)
+            print("[tests] coding tokens are not spent", file=sys.stderr)
+            return 3
+
         print(f"[agent] {kind}, режим {args.mode}, сид {args.seed}"
-              + (", запись памяти включена" if args.mode == "memory-on" and write_back else ""))
+              + (", запись памяти включена" if memory_on and write_back else ""))
         agent = run_agent(kind, cfg, wt, task, clone, run_dir, env_extra)
         collect_hook_artifacts(wt, run_dir)
+        try:
+            protected_proof = verify_protected_tests(wt, test_manifest)
+            unprotect_tests(wt, test_manifest)
+            protection_active = False
+            base_equality = verify_pristine_tests(wt, test_manifest)
+            pristine_proof = {"ok": True, "protected": protected_proof,
+                              "base_equality_after_unlock": base_equality,
+                              "hash_mode_equal": True, "mismatches": []}
+        except TestProtectionError as exc:
+            pristine_proof = {"ok": False, "hash_mode_equal": False,
+                              "mismatches": [{"reason": "protection_failure", "detail": str(exc)}]}
+            print(f"[tests] pristine proof failed: {exc}", file=sys.stderr)
+        (run_dir / "base_tests_pristine_proof.json").write_text(
+            json.dumps(pristine_proof, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if not pristine_proof.get("ok"):
+            print("[tests] fail closed before memory write or scoring", file=sys.stderr)
+            return 4
         if agent["rc"] not in (0, None):
             print(f"[agent] rc={agent['rc']} — прогон пойдёт дальше, но смотри логи",
                   file=sys.stderr)
@@ -541,8 +944,8 @@ def main() -> int:
         ctx_chars = len(ctx.read_text(encoding="utf-8")) if ctx.exists() else 0
         # Молчаливый memory-on, в который ничего не приехало, — это memory-off
         # под другим именем. Такой прогон не считается.
-        memory_ok = not (args.mode == "memory-on" and kind not in ("null", "oracle")
-                         and ctx_chars == 0)
+        memory_ok = not (memory_on and kind not in ("null", "oracle")
+                         and (ctx_chars == 0 or not memory_read_ok))
         if not memory_ok:
             print("[память] в контекст ничего не уехало: снапшот пуст или хук не отработал.\n"
                   "         Прогон помечен невалидным — сравнивать его с memory-off нельзя.",
@@ -550,6 +953,22 @@ def main() -> int:
 
         diff = capture_diff(wt, run_dir, exclude=removed)
         print(f"[diff] файлов {diff['files_changed']}, +{diff['insertions']}/-{diff['deletions']}")
+
+        mutation_file = run_dir / "memory_mutations.json"
+        if memory_on and write_back and kind not in ("null", "oracle"):
+            if not mutation_file.exists():
+                print("[память] агент не оставил memory_mutations.json", file=sys.stderr)
+            else:
+                try:
+                    memory_batch = json.loads(mutation_file.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    print(f"[память] mutation batch is invalid JSON: {exc}", file=sys.stderr)
+        elif memory_on and not write_back:
+            print("[память] write_back=false: это только legacy naive-dump control", file=sys.stderr)
+
+        # Grading never consumes agent-edited tests. Added tests remain visible in the diff,
+        # while the executed suites are restored from the pristine base and then hidden overlay.
+        restore_pristine_tests(wt, pristine)
 
         # регрессия — на дереве агента, до наложения скрытых тестов.
         # Скрытые тесты исключены: в старой редакции они могут честно упасть
@@ -560,6 +979,56 @@ def main() -> int:
         overlay_hidden_tests(clone, wt, task)
         hidden = run_tests(wt, cfg, task.hidden_tests, run_dir, "hidden")
 
+        diff_text = (run_dir / "diff.patch").read_text(encoding="utf-8")
+        architecture = architecture_grade(task, diff["touched"], diff_text)
+        null_passed = task.grading.get("null_passed")
+        oracle_passed = task.grading.get("oracle_passed")
+        lift, lift_reason = feature_lift(hidden["passed"], null_passed, oracle_passed)
+        feature_passed = (hidden["passed"] - null_passed) if null_passed is not None else None
+        feature_total = ((oracle_passed - null_passed)
+                         if null_passed is not None and oracle_passed is not None else None)
+
+        # Transfer facts are committed only after observable checks. C0 facts remain
+        # immutable in the precision protocol; tooling/sandbox lessons stay diagnostic.
+        if (memory_on and write_back and kind not in ("null", "oracle")
+                and memory_backend and memory_read and memory_batch is not None):
+            try:
+                selection_log = memory_read.metrics.get("selection") or {}
+                all_ranked = ((selection_log.get("selected") or [])
+                              + (selection_log.get("rejected") or []))
+                c0_fact_ids = {item["fact_id"] for item in all_ranked
+                               if item.get("origin") == "c0"}
+                quality_confirmed = bool(pristine_proof.get("ok") and regression.get("green")
+                                         and hidden.get("green") and architecture.get("green"))
+                memory_batch, memory_promotion = prepare_precision_batch(
+                    memory_batch, task, diff["touched"], quality_confirmed, c0_fact_ids,
+                    cfg["memory"].get("retrieval_profile") == "precision-v1")
+                memory_write = memory_backend.apply(
+                    memory_batch, memory_read.metrics.get("fact_ids", []), task.id)
+                memory_write_ok = True
+                (run_dir / "memory_write.json").write_text(
+                    json.dumps(memory_write, indent=2, ensure_ascii=False), encoding="utf-8")
+                (run_dir / "memory_promotion.json").write_text(
+                    json.dumps(memory_promotion, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+            except (BackendMemoryError, json.JSONDecodeError) as exc:
+                print(f"[память] write-back rejected: {exc}", file=sys.stderr)
+
+        injected_ids = memory_read.metrics.get("fact_ids", []) if memory_read else []
+        expected = task.expected_facts
+        relevant = sorted(set(injected_ids) & set(expected))
+        irrelevant = sorted(set(injected_ids) - set(expected))
+        retrieval = {
+            **(memory_read.metrics if memory_read else {
+                "backend": None, "fallback": False, "state_version": None,
+                "fact_ids": [], "facts_count": 0, "chars": 0, "estimated_tokens": 0,
+                "wall_sec": 0.0, "provider_usage": None}),
+            "expected_fact_ids": expected, "relevant_fact_ids": relevant,
+            "irrelevant_fact_ids": irrelevant, "irrelevant_count": len(irrelevant),
+            "precision": round(len(relevant) / len(injected_ids), 3) if injected_ids else None,
+            "coverage": round(len(relevant) / len(expected), 3) if expected else None,
+        }
+
         invalid_reasons = []
         if agent["rc"] != 0:
             invalid_reasons.append(f"agent_rc={agent['rc']}")
@@ -569,14 +1038,64 @@ def main() -> int:
             invalid_reasons.append("agent_cli_version_missing")
         if not memory_ok:
             invalid_reasons.append("memory_not_injected")
+        if memory_on and write_back and kind not in ("null", "oracle") and not memory_write_ok:
+            invalid_reasons.append("memory_write_missing_or_rejected")
         if not regression["parsed"]:
             invalid_reasons.append("regression_junit_missing")
         if not hidden["parsed"]:
             invalid_reasons.append("hidden_junit_missing")
+        if not pristine_proof.get("ok"):
+            invalid_reasons.append("base_tests_not_pristine")
         valid_run = not invalid_reasons
         task_success = valid_run and regression["green"] and hidden["green"]
+        eligible, eligibility_reasons = analytical_eligibility(
+            valid_run, regression, diff, memory_on, memory_read_ok,
+            memory_write_ok if write_back else False,
+            pristine_tests_ok=bool(pristine_proof.get("ok")))
+
+        decisions = {(d.get("fact_id")): d for d in ((memory_batch or {}).get("task") or {}).get("decisions", [])}
+        selected_meta = {item["fact_id"]: item for item in
+                         (((memory_read.metrics.get("selection") or {}).get("selected") or [])
+                          if memory_read else [])}
+        fact_content = {fact["fact_id"]: fact.get("content") or fact.get("statement", "")
+                        for fact in (memory_read.facts if memory_read else [])}
+        attribution = {
+            "task": task.id, "mode": args.mode, "seed": args.seed,
+            "links": [{
+                "fact_id": fact_id, "read": True,
+                "origin": selected_meta.get(fact_id, {}).get("origin"),
+                "selection_reason": selected_meta.get(fact_id, {}).get("reason"),
+                "exact_content_sha256": hashlib.sha256(
+                    fact_content.get(fact_id, "").encode()).hexdigest(),
+                "declared_expected": fact_id in expected,
+                "task_marked_used": bool(memory_write and fact_id in memory_write.get("used_facts", [])),
+                "code_decision": decisions.get(fact_id),
+                "claimed_diff_paths": (decisions.get(fact_id) or {}).get("diff_paths", []),
+                "claimed_paths_in_actual_diff": sorted(set(
+                    (decisions.get(fact_id) or {}).get("diff_paths", [])) & set(diff["touched"])),
+                "trace_complete": bool(
+                    memory_write and fact_id in memory_write.get("used_facts", [])
+                    and decisions.get(fact_id)
+                    and (decisions.get(fact_id) or {}).get("diff_paths")
+                    and set((decisions.get(fact_id) or {}).get("diff_paths", [])).issubset(
+                        set(diff["touched"]))),
+                "architecture_green": architecture["green"],
+                "regression_failures": regression.get("failing", []),
+                "hidden_failures": hidden.get("failing", []),
+                "hidden_passed": hidden["passed"], "hidden_total": hidden["tests"] - hidden["skipped"],
+            } for fact_id in injected_ids],
+            "produced_facts": (memory_write or {}).get("produced_facts", []),
+            "causal_boundary": ("Fact-level association requires claimed use plus decision paths; "
+                                "outcomes alone do not establish that memory caused a change."),
+            "complete": (not memory_on or (len(injected_ids) == len(fact_content)
+                                           and memory_write_ok)),
+        }
+        (run_dir / "attribution.json").write_text(
+            json.dumps(attribution, indent=2, ensure_ascii=False), encoding="utf-8")
 
         metrics = {
+            "experiment_id": experiment_id,
+            "protocol_mode": protocol_mode,
             "task": task.id,
             "title": task.title,
             "mode": args.mode,
@@ -586,24 +1105,56 @@ def main() -> int:
             "agent_model": agent.get("model", cfg["agent"].get("model")),
             "agent_effort": agent.get("effort", cfg["agent"].get("effort")),
             "agent_cli_version": agent.get("cli_version"),
-            "agent_cmd": cfg["agent"].get("cmd") if kind not in ("null", "oracle") else None,
-            "memory_mode": cfg["memory"]["mode"],
+            "agent_cmd": agent.get("cmd") if kind not in ("null", "oracle") else None,
+            "agent_attempts": agent.get("attempts", 1),
+            "agent_transient_retries": agent.get("transient_retries", 0),
+            "memory_mode": cfg["memory"].get("backend", "file"),
             "memory_write_back": write_back,
             "memory_ok": memory_ok,
             "base_commit": task.base_commit,
             "solution_commit": task.solution_commit,
             "c0": meta.get("c0"),
             "slices": task.slices,
+            "transfer_cluster": task.transfer_cluster,
             "wall_sec": round(agent["wall_sec"], 1),
             "usage": agent["usage"],
             "usage_parsed": agent["usage_parsed"],
             "valid_run": valid_run,
             "invalid_reasons": invalid_reasons,
+            "analytical_eligible": eligible,
+            "analytical_ineligible_reasons": eligibility_reasons,
             "task_success": task_success,
             "diff": diff,
+            "test_protection": {
+                "base_manifest_sha256": test_manifest.get("manifest_sha256"),
+                "proof": pristine_proof,
+            },
             "regression": regression,
             "hidden": hidden,
-            "score": hidden["ratio"],          # доля пройденных проверок, не бинарь
+            "grading": {
+                "null_passed": null_passed, "oracle_passed": oracle_passed,
+                "feature_passed": feature_passed, "feature_total": feature_total,
+                "feature_lift": lift, "feature_lift_boundary": lift_reason,
+                "primary_score": lift,
+            },
+            "retrieval": retrieval,
+            "retrieval_leakage_check": leakage_check,
+            "memory_read": memory_read.metrics if memory_read else None,
+            "memory_write": memory_write,
+            "memory_promotion": memory_promotion,
+            "architecture": architecture,
+            "attribution": attribution,
+            "process": {
+                "coding": {"wall_sec": round(agent["wall_sec"], 1), "usage": agent["usage"]},
+                "memory_read": memory_read.metrics if memory_read else None,
+                "memory_write": memory_write,
+                "evolve": None,
+                "files_read": None,
+                "time_to_first_relevant_file_sec": None,
+                "trace_available": False,
+            },
+            "score": lift,                    # primary: normalized feature-dependent lift
+            "hidden_micro_score": hidden["ratio"],  # secondary diagnostic
             "score_binary": 1.0 if hidden["green"] else 0.0,
             "context_injected_chars": ctx_chars,
         }
@@ -618,6 +1169,12 @@ def main() -> int:
         print(f"[итог] артефакты в {run_dir}")
         return 0 if valid_run else 4
     finally:
+        if protection_active:
+            try:
+                unprotect_tests(wt, test_manifest)
+            except TestProtectionError as exc:
+                print(f"[tests] failed to clear protection during cleanup: {exc}", file=sys.stderr)
+        shutil.rmtree(pristine, ignore_errors=True)
         if not args.keep_worktree:
             drop_workspace(wt)
 
